@@ -41,3 +41,7 @@ coverage/
 .pytest_cache/
 
 VersionHistory/
+
+#claude
+CLAUDE.md
+.claude/

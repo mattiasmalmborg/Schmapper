@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo, useRef } from 'react';
-import { Download, Upload, Play, Trash2, Plus, Database, Eye, Save, FileText, AlertCircle, Repeat, Link } from 'lucide-react';
+import { Download, Upload, Play, Trash2, Plus, Database, Eye, Save, FileText, AlertCircle, Repeat, Link, ChevronDown, ChevronRight, X } from 'lucide-react';
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
 
@@ -354,6 +354,7 @@ const SchemaMapper = () => {
   }, [loadSchema, showNotification, addLog]);
 
   const handleDragStart = useCallback((e, field, type) => {
+    console.log('[DRAG START]', { field, type });
     e.dataTransfer.effectAllowed = 'copy';
     setDraggedField({ ...field, type });
   }, []);
@@ -366,6 +367,8 @@ const SchemaMapper = () => {
   const handleDrop = useCallback((e, targetField) => {
     e.preventDefault();
     e.stopPropagation();
+    
+    console.log('[DROP]', { draggedField, targetField });
     
     if (!draggedField) return;
     
@@ -382,6 +385,10 @@ const SchemaMapper = () => {
         return;
       }
       
+      // NEW: Check if target is a repeatable field (not wrapper)
+      const isTargetRepeatable = targetField.repeatable || targetField.maxOccurs === 'unbounded' || 
+        (targetField.maxOccurs && parseInt(targetField.maxOccurs) > 1);
+      
       // Create container mapping
       const containerMapping = {
         id: `m-repeat-${Date.now()}-${Math.random()}`,
@@ -391,11 +398,12 @@ const SchemaMapper = () => {
         params: {},
         aggregation: 'repeat',
         loop_element_path: repeatingElem.path,
-        target_wrapper_path: targetField.path,
+        target_wrapper_path: isTargetRepeatable ? null : targetField.path,  // NEW: null if no wrapper
         is_relative_path: true,
         is_container: true,
         repeating_element: repeatingElem,
-        child_mappings: []
+        child_mappings: [],
+        repeat_to_single: isTargetRepeatable  // NEW: Flag for repeat-to-single
       };
 
       setMappings(prev => [...prev, containerMapping]);
@@ -407,7 +415,8 @@ const SchemaMapper = () => {
         [repeatingElem.path]: true
       }));
       
-      addLog('info', `Created repeating container: ${repeatingElem.path} → ${targetField.path}`);
+      const mappingType = isTargetRepeatable ? 'repeat-to-single' : 'repeat-to-wrapper';
+      addLog('info', `Created ${mappingType} container: ${repeatingElem.path} → ${targetField.path}`);
       showNotification(`Upprepande mappning skapad: ${repeatingElem.tag} → ${targetField.name}`, 'success');
       
       setDraggedField(null);
@@ -421,6 +430,90 @@ const SchemaMapper = () => {
       const sourceField = draggedField.type === 'source' ? sourceSchema?.fields.find(f => f.id === draggedField.id) : null;
       const parentRepeating = draggedField.parentRepeating;
       const repContainer = parentRepeating ? getRepeatingContainerForElement(parentRepeating) : null;
+
+      console.log('[DROP DEBUG]', {
+        draggedFieldId: draggedField.id,
+        parentRepeating,
+        hasContainer: !!repContainer,
+        targetField: targetField.name,
+        targetRepeatable: targetField.repeatable,
+        targetMaxOccurs: targetField.maxOccurs
+      });
+
+      // NEW: Check if target is a repeatable field (for repeat-to-single)
+      // Check both field properties AND if it exists in repeating_elements
+      let isTargetRepeatable = targetField.repeatable || targetField.maxOccurs === 'unbounded' || 
+        (targetField.maxOccurs && parseInt(targetField.maxOccurs) > 1);
+      
+      // Also check if target schema has this as a repeating element (wrapper-less)
+      if (!isTargetRepeatable && targetSchema?.repeating_elements) {
+        const targetAsRepeating = targetSchema.repeating_elements.find(r => 
+          r.path === targetField.path || r.name === targetField.name
+        );
+        if (targetAsRepeating) {
+          isTargetRepeatable = true;
+          console.log('[DROP DEBUG] Target found in repeating_elements:', targetAsRepeating);
+        }
+      }
+      
+      console.log('[DROP DEBUG] isTargetRepeatable:', isTargetRepeatable, 'will create repeat-to-single:', parentRepeating && isTargetRepeatable && !repContainer);
+      
+      // NEW: If source is from repeating element AND target is repeatable field, create/use repeat-to-single container
+      if (parentRepeating && isTargetRepeatable && !repContainer) {
+        console.log('[DROP DEBUG] Creating repeat-to-single container...');
+        // Need to create a repeat-to-single container first
+        const sourceRepElem = sourceSchema?.repeating_elements?.find(r => r.path === parentRepeating);
+        
+        console.log('[DROP DEBUG] sourceRepElem:', sourceRepElem);
+        
+        if (sourceRepElem) {
+          // Create repeat-to-single container
+          const newContainer = {
+            id: `container-${Date.now()}`,
+            source: [],
+            target: '',
+            aggregation: 'repeat',
+            loop_element_path: sourceRepElem.path,
+            target_wrapper_path: null,  // No wrapper for repeat-to-single
+            is_container: true,
+            transforms: [],
+            params: {},
+            repeat_to_single: true,
+            repeating_element: sourceRepElem,  // NEW: Add for UI display
+            child_mappings: []
+          };
+          
+          // Create the field mapping
+          const newMapping = {
+            id: `m-${Date.now()}-${Math.random()}`,
+            source: [draggedField.id],
+            target: targetField.id,
+            transforms: [],
+            params: { separator: ' ' },
+            aggregation: 'foreach',
+            parent_repeat_container: newContainer.id
+          };
+          
+          // Add both
+          setMappings(prev => [...prev, newContainer, newMapping]);
+          
+          // Link child to container
+          newContainer.child_mappings = [newMapping.id];
+          
+          // Auto-expand
+          setExpandedRepeatingElements(prev => ({
+            ...prev,
+            [sourceRepElem.path]: true
+          }));
+          
+          addLog('info', `Created repeat-to-single container and mapping: ${sourceRepElem.path} → ${targetField.name}`);
+          showNotification(`Repeat-to-single mappning skapad: ${sourceRepElem.tag} → ${targetField.name}`, 'success');
+          setSelectedMapping(newMapping.id);
+          setDraggedField(null);
+          setHoveredTarget(null);
+          return;
+        }
+      }
 
       const existingMapping = mappings.find(m => m.target === targetField.id);
       
@@ -532,6 +625,32 @@ const SchemaMapper = () => {
     showNotification('Mappning borttagen');
   }, [mappings, selectedMapping, addLog, showNotification]);
 
+  const handleRemoveSourceFromMapping = useCallback((mappingId, sourceId) => {
+    setMappings(prev => prev.map(m => {
+      if (m.id === mappingId) {
+        const newSource = m.source.filter(s => s !== sourceId);
+        if (newSource.length === 0) {
+          return null;
+        }
+        return { ...m, source: newSource };
+      }
+      return m;
+    }).filter(Boolean));
+    addLog('info', 'Source removed from mapping');
+  }, [addLog]);
+
+  const handleUpdateMappingTransforms = useCallback((mappingId, transforms) => {
+    setMappings(prev => prev.map(m =>
+      m.id === mappingId ? { ...m, transforms } : m
+    ));
+  }, []);
+
+  const handleUpdateMappingParams = useCallback((mappingId, params) => {
+    setMappings(prev => prev.map(m =>
+      m.id === mappingId ? { ...m, params: { ...m.params, ...params } } : m
+    ));
+  }, []);
+
   const handleTransformChange = useCallback((mappingId, transformId) => {
     setMappings(prev => prev.map(m => {
       if (m.id !== mappingId) return m;
@@ -561,14 +680,42 @@ const SchemaMapper = () => {
     if (constant) return `"${constant.value}"`;
     
     if (!sourceSchema) return '';
-    const field = sourceSchema.fields.find(f => f.id === fieldId);
-    return field ? field.name : '';
+    
+    // Search in regular fields
+    let field = sourceSchema.fields.find(f => f.id === fieldId);
+    if (field) return field.name;
+    
+    // Search in repeating elements child fields
+    if (sourceSchema.repeating_elements) {
+      for (const repElem of sourceSchema.repeating_elements) {
+        if (repElem.fields) {
+          field = repElem.fields.find(f => f.id === fieldId);
+          if (field) return field.name || field.tag;
+        }
+      }
+    }
+    
+    return fieldId;
   }, [constants, sourceSchema]);
 
   const getTargetFieldName = useCallback((fieldId) => {
     if (!targetSchema) return '';
-    const field = targetSchema.fields.find(f => f.id === fieldId);
-    return field ? field.name : '';
+    
+    // Search in regular fields
+    let field = targetSchema.fields.find(f => f.id === fieldId);
+    if (field) return field.name;
+    
+    // Search in repeating elements child fields
+    if (targetSchema.repeating_elements) {
+      for (const repElem of targetSchema.repeating_elements) {
+        if (repElem.fields) {
+          field = repElem.fields.find(f => f.id === fieldId);
+          if (field) return field.name || field.tag;
+        }
+      }
+    }
+    
+    return fieldId;
   }, [targetSchema]);
 
   const getMappingsForTarget = useCallback((targetId) => {
@@ -1056,147 +1203,153 @@ const SchemaMapper = () => {
                   Nytt fast värde
                 </button>
                 
-                {/* Schema Fields */}
+                {/* Repeating Elements Section */}
+                {sourceSchema.repeating_elements && sourceSchema.repeating_elements.length > 0 && (
+                  <div className="mb-4">
+                    <div className="text-xs font-semibold text-pink-400 mb-2 flex items-center gap-2">
+                      <Repeat className="w-4 h-4" />
+                      Upprepande element ({sourceSchema.repeating_elements.length})
+                    </div>
+                    {sourceSchema.repeating_elements.map((repeatingElem, idx) => {
+                      const container = getRepeatingContainerForElement(repeatingElem.path);
+                      const isExpanded = expandedRepeatingElements[repeatingElem.path];
+                      
+                      console.log('[REPEATING ELEM]', repeatingElem.tag, 'container:', container?.id, 'isExpanded:', isExpanded);
+                      
+                      return (
+                        <div key={`repeat-${idx}`} className="mb-2">
+                          <div
+                            draggable={!processing}
+                            onDragStart={(e) => handleDragStart(e, { repeatingElement: repeatingElem }, 'repeating-source')}
+                            className={`bg-slate-700 hover:bg-slate-600 p-3 rounded cursor-move transition group ${
+                              container ? 'border-l-4 border-pink-500' : ''
+                            }`}
+                          >
+                            <div className="flex items-center mb-2">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setExpandedRepeatingElements(prev => ({
+                                    ...prev,
+                                    [repeatingElem.path]: !prev[repeatingElem.path]
+                                  }));
+                                }}
+                                className="text-pink-400 hover:text-pink-300 transition mr-2 flex-shrink-0"
+                                title="Visa/dölj barn-element"
+                              >
+                                {isExpanded ? '▼' : '▶'}
+                              </button>
+                              <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0 mr-2" title="Upprepande element" />
+                              <div className="flex-1 min-w-0">
+                                <div className="font-medium text-sm text-blue-300 mb-1 truncate flex items-center gap-2" title={repeatingElem.tag}>
+                                  {repeatingElem.tag}
+                                  <span className="text-xs bg-pink-600 px-2 py-0.5 rounded">{repeatingElem.count}x</span>
+                                </div>
+                                <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
+                                  {repeatingElem.path}
+                                </div>
+                              </div>
+                            </div>
+                            {container && (
+                              <div className="text-xs text-pink-400 flex items-center gap-1 ml-10">
+                                <span>✓</span> Mappad till {container.target_wrapper_path?.split('/').pop()}
+                              </div>
+                            )}
+                          </div>
+                          
+                          {/* Child fields */}
+                          {isExpanded && repeatingElem.fields && (
+                            <div className="ml-6 mt-2 space-y-1 border-l-2 border-pink-500 pl-3">
+                              {repeatingElem.fields.map((childField, childIdx) => {
+                                const childFieldObj = {
+                                  id: childField.id,
+                                  name: childField.name || childField.tag,
+                                  path: childField.path,
+                                  type: childField.type || 'string',
+                                  parentRepeating: repeatingElem.path
+                                };
+                                const isChildMapped = getAllMappedSourceIds.has(childField.id);
+                                // NEW: Always draggable (for repeat-to-single support)
+                                const isDraggable = !processing;
+                                
+                                console.log('[CHILD FIELD]', childFieldObj.name, 'container:', !!container, 'draggable:', isDraggable);
+                                
+                                return (
+                                  <div
+                                    key={childIdx}
+                                    draggable={isDraggable}
+                                    onDragStart={(e) => isDraggable && handleDragStart(e, childFieldObj, 'source')}
+                                    className={`bg-slate-700 hover:bg-slate-600 p-2 rounded text-xs transition ${
+                                      isDraggable ? 'cursor-move' : 'opacity-50 cursor-not-allowed'
+                                    } ${isChildMapped ? 'border-l-2 border-green-500' : ''}`}
+                                    title={isDraggable ? 'Dra för att mappa (skapar container automatiskt)' : 'Processing...'}
+                                  >
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex-1 min-w-0">
+                                        <div className="text-blue-200 truncate">{childFieldObj.name}</div>
+                                        <div className="text-slate-500 font-mono truncate">{childField.relative_path || childField.path}</div>
+                                      </div>
+                                      <span className="text-slate-500 ml-2">{childFieldObj.type}</span>
+                                    </div>
+                                    {isChildMapped && (
+                                      <div className="text-green-400 mt-1">✓ Mappad</div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                
+                {/* Regular Fields Section */}
                 <div className="text-xs font-semibold text-blue-400 mb-2">Källfält</div>
                 {sourceSchema.fields.map(field => {
                   const isMapped = getAllMappedSourceIds.has(field.id);
                   const displayName = field.name;
                   const fullPath = field.path || field.name;
                   
-                  // Check if this is a repeating element
-                  const repeatingElem = sourceSchema.repeating_elements?.find(r => r.path === fullPath);
-                  const isExpanded = expandedRepeatingElements[fullPath];
+                  // Skip if this field is part of any repeating element
+                  const isPartOfRepeating = sourceSchema.repeating_elements?.some(r => 
+                    fullPath.startsWith(r.path)
+                  );
                   
-                  if (repeatingElem) {
-                    // This is a repeating wrapper element
-                    const container = getRepeatingContainerForElement(repeatingElem.path);
-                    
-                    return (
-                      <div key={field.id} className="mb-2">
-                        <div
-                          draggable={!processing}
-                          onDragStart={(e) => handleDragStart(e, { ...field, repeatingElement: repeatingElem }, 'repeating-source')}
-                          className={`bg-slate-700 hover:bg-slate-600 p-3 rounded cursor-move transition group ${
-                            container ? 'border-l-4 border-pink-500' : ''
-                          }`}
-                        >
-                          <div className="flex items-center justify-between mb-2">
-                            <div className="flex items-center gap-2 flex-1 min-w-0">
-                              <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0" title="Upprepande element" />
-                              <div className="flex-1 min-w-0">
-                                <div className="font-medium text-sm text-blue-300 mb-1 truncate flex items-center gap-2" title={displayName}>
-                                  {displayName}
-                                  <span className="text-xs bg-pink-600 px-2 py-0.5 rounded">{repeatingElem.count}x</span>
-                                </div>
-                                <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
-                                  {fullPath}
-                                </div>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-2 flex-shrink-0">
-                              <span className="text-xs text-slate-500 bg-slate-800 px-2 py-1 rounded">
-                                {field.type}
-                              </span>
-                              <button
-                                onClick={() => setExpandedRepeatingElements(prev => ({
-                                  ...prev,
-                                  [fullPath]: !prev[fullPath]
-                                }))}
-                                className="text-pink-400 hover:text-pink-300 transition"
-                                title="Visa/dölj barn-element"
-                              >
-                                {isExpanded ? '▼' : '▶'}
-                              </button>
-                            </div>
-                          </div>
-                          {container && (
-                            <div className="text-xs text-pink-400 flex items-center gap-1">
-                              <span>✓</span> Mappad till {container.target_wrapper_path?.split('/').pop()}
-                            </div>
-                          )}
-                        </div>
-                        
-                        {/* Child fields */}
-                        {isExpanded && repeatingElem.fields && (
-                          <div className="ml-6 mt-2 space-y-1 border-l-2 border-pink-500 pl-3">
-                            {repeatingElem.fields.map((childField, idx) => {
-                              const childFieldObj = {
-                                id: childField.id,
-                                name: childField.name || childField.tag,
-                                path: childField.path,
-                                type: childField.type || 'string',
-                                parentRepeating: repeatingElem.path
-                              };
-                              const isChildMapped = getAllMappedSourceIds.has(childField.id);
-                              
-                              return (
-                                <div
-                                  key={idx}
-                                  draggable={!processing && container}
-                                  onDragStart={(e) => container && handleDragStart(e, childFieldObj, 'source')}
-                                  className={`bg-slate-700 hover:bg-slate-600 p-2 rounded text-xs transition ${
-                                    container ? 'cursor-move' : 'opacity-50 cursor-not-allowed'
-                                  } ${isChildMapped ? 'border-l-2 border-green-500' : ''}`}
-                                  title={container ? 'Dra för att mappa' : 'Skapa först wrapper-mappning'}
-                                >
-                                  <div className="flex items-center justify-between">
-                                    <div className="flex-1 min-w-0">
-                                      <div className="text-blue-200 truncate">{childFieldObj.name}</div>
-                                      <div className="text-slate-500 font-mono truncate">{childField.relative_path || childField.path}</div>
-                                    </div>
-                                    <span className="text-slate-500 ml-2">{childFieldObj.type}</span>
-                                  </div>
-                                  {isChildMapped && (
-                                    <div className="text-green-400 mt-1">✓ Mappad</div>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  } else {
-                    // Regular field (not repeating)
-                    // Skip if it's a child of a repeating element
-                    const isChildOfRepeating = sourceSchema.repeating_elements?.some(r => 
-                      fullPath.startsWith(r.path + '/')
-                    );
-                    
-                    if (isChildOfRepeating) {
-                      return null; // Don't show - will be shown under parent
-                    }
-                    
-                    return (
-                      <div
-                        key={field.id}
-                        draggable={!processing}
-                        onDragStart={(e) => handleDragStart(e, field, 'source')}
-                        className={`bg-slate-700 hover:bg-slate-600 p-3 rounded cursor-move transition group ${
-                          isMapped ? 'border-l-4 border-green-500' : ''
-                        }`}
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex-1 min-w-0">
-                            <div className="font-medium text-sm text-blue-300 mb-1 truncate" title={displayName}>
-                              {displayName}
-                            </div>
-                            <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
-                              {fullPath}
-                            </div>
-                          </div>
-                          <span className="text-xs text-slate-500 bg-slate-800 px-2 py-1 rounded ml-2 flex-shrink-0">
-                            {field.type}
-                          </span>
-                        </div>
-                        {isMapped && (
-                          <div className="text-xs text-green-400 flex items-center gap-1">
-                            <span>✓</span> Mappad
-                          </div>
-                        )}
-                      </div>
-                    );
+                  if (isPartOfRepeating) {
+                    return null; // Already shown in repeating elements section
                   }
+                  
+                  return (
+                    <div
+                      key={field.id}
+                      draggable={!processing}
+                      onDragStart={(e) => handleDragStart(e, field, 'source')}
+                      className={`bg-slate-700 hover:bg-slate-600 p-3 rounded cursor-move transition group ${
+                        isMapped ? 'border-l-4 border-green-500' : ''
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium text-sm text-blue-300 mb-1 truncate" title={displayName}>
+                            {displayName}
+                          </div>
+                          <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
+                            {fullPath}
+                          </div>
+                        </div>
+                        <span className="text-xs text-slate-500 bg-slate-800 px-2 py-1 rounded ml-2 flex-shrink-0">
+                          {field.type}
+                        </span>
+                      </div>
+                      {isMapped && (
+                        <div className="text-xs text-green-400 flex items-center gap-1">
+                          <span>✓</span> Mappad
+                        </div>
+                      )}
+                    </div>
+                  );
                 })}
               </>
             )}
@@ -1313,7 +1466,7 @@ const SchemaMapper = () => {
                         })}
                       </div>
 
-                      {/* Transform parameters (same as before) */}
+                      {/* Transform parameters */}
                       {currentTransforms.includes('concat') && mapping.source.length > 1 && (
                         <div className="pt-3 border-t border-slate-700">
                           <label className="text-xs text-slate-400">Separator:</label>
@@ -1522,6 +1675,10 @@ const SchemaMapper = () => {
                 {/* Repeating Containers */}
                 {mappings.filter(m => m.is_container).map(container => {
                   const childMappings = mappings.filter(m => m.parent_repeat_container === container.id);
+                  const sourceElemName = container.loop_element_path?.split('/').pop() || 'Element';
+                  const targetElemName = container.target_wrapper_path?.split('/').pop() || 
+                    (container.repeat_to_single ? '(Flera fält)' : 'Element');
+                  const isRepeatToSingle = container.repeat_to_single;
                   
                   return (
                     <div
@@ -1532,11 +1689,16 @@ const SchemaMapper = () => {
                         <div className="flex items-center gap-2">
                           <Repeat className="w-5 h-5 text-pink-400" />
                           <div>
-                            <div className="font-medium text-pink-300">
-                              {container.repeating_element?.tag} (Upprepande)
+                            <div className="font-medium text-pink-300 flex items-center gap-2">
+                              {sourceElemName} → {targetElemName}
+                              {isRepeatToSingle && (
+                                <span className="text-xs bg-pink-700 px-2 py-0.5 rounded">
+                                  Repeat-to-Single
+                                </span>
+                              )}
                             </div>
                             <div className="text-xs text-pink-400 mt-1">
-                              {container.loop_element_path} → {container.target_wrapper_path}
+                              {container.loop_element_path} → {container.target_wrapper_path || '(flera upprepade fält)'}
                             </div>
                           </div>
                         </div>
@@ -1549,46 +1711,167 @@ const SchemaMapper = () => {
                         </button>
                       </div>
                       
-                      <div className="ml-4 space-y-2 border-l-2 border-pink-500 pl-4">
+                      <div className="ml-4 space-y-3 border-l-2 border-pink-500 pl-4">
                         {childMappings.map(mapping => {
                           const currentTransforms = mapping.transforms || [];
+                          const isSelected = selectedMapping === mapping.id;
+                          
                           return (
-                            <div key={mapping.id} className="bg-slate-800 rounded p-3">
+                            <div 
+                              key={mapping.id} 
+                              className={`bg-slate-700 rounded p-3 transition ${
+                                isSelected ? 'ring-2 ring-purple-400' : ''
+                              }`}
+                              onClick={() => setSelectedMapping(mapping.id)}
+                            >
+                              {/* Source and Target Badges */}
                               <div className="flex items-center justify-between mb-2">
-                                <div className="flex items-center gap-2 flex-1">
-                                  {mapping.source.map(srcId => (
-                                    <div key={srcId} className="bg-blue-600 px-2 py-1 rounded text-xs">
-                                      {getSourceFieldName(srcId)}
-                                    </div>
-                                  ))}
+                                <div className="flex items-center gap-2 flex-1 flex-wrap">
+                                  {mapping.source.map(srcId => {
+                                    const constant = constants.find(c => c.id === srcId);
+                                    return (
+                                      <div 
+                                        key={srcId} 
+                                        className={`px-2 py-1 rounded text-xs ${
+                                          constant ? 'bg-purple-600' : 'bg-blue-600'
+                                        }`}
+                                      >
+                                        {constant ? constant.name : getSourceFieldName(srcId)}
+                                      </div>
+                                    );
+                                  })}
                                   <span className="text-slate-400 text-xs">→</span>
                                   <div className="bg-green-600 px-2 py-1 rounded text-xs">
                                     {getTargetFieldName(mapping.target)}
                                   </div>
                                 </div>
                                 <button
-                                  onClick={() => handleDeleteMapping(mapping.id)}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteMapping(mapping.id);
+                                  }}
                                   className="text-slate-400 hover:text-red-400 ml-2"
                                   disabled={processing}
                                 >
                                   <Trash2 className="w-3 h-3" />
                                 </button>
                               </div>
-                              {currentTransforms.length > 0 && (
-                                <div className="flex gap-1 flex-wrap mt-2">
-                                  {currentTransforms.map(t => (
-                                    <span key={t} className="text-xs bg-purple-600 px-2 py-0.5 rounded">
-                                      {transforms.find(tr => tr.id === t)?.name || t}
-                                    </span>
-                                  ))}
+                              
+                              {/* Transform Buttons */}
+                              <div className="flex flex-wrap gap-1 mb-2">
+                                {transforms.map(transform => (
+                                  <button
+                                    key={transform.id}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const newTransforms = currentTransforms.includes(transform.id)
+                                        ? currentTransforms.filter(t => t !== transform.id)
+                                        : [...currentTransforms, transform.id];
+                                      handleUpdateMappingTransforms(mapping.id, newTransforms);
+                                    }}
+                                    className={`px-2 py-1 text-xs rounded transition ${
+                                      currentTransforms.includes(transform.id)
+                                        ? 'bg-purple-600 text-white'
+                                        : 'bg-slate-600 text-slate-300 hover:bg-slate-500'
+                                    }`}
+                                    disabled={processing}
+                                  >
+                                    {transform.name}
+                                  </button>
+                                ))}
+                              </div>
+                              
+                              {/* Transform Parameters */}
+                              {currentTransforms.includes('concat') && (
+                                <input
+                                  type="text"
+                                  placeholder="Separator (default: mellanslag)"
+                                  value={mapping.params?.separator || ' '}
+                                  onChange={(e) => handleUpdateMappingParams(mapping.id, { separator: e.target.value })}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs mb-1"
+                                />
+                              )}
+                              
+                              {currentTransforms.includes('replace') && (
+                                <div className="space-y-1 mb-1">
+                                  <input
+                                    type="text"
+                                    placeholder="Från (text att ersätta)"
+                                    value={mapping.params?.from_ || ''}
+                                    onChange={(e) => handleUpdateMappingParams(mapping.id, { from_: e.target.value })}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs"
+                                  />
+                                  <input
+                                    type="text"
+                                    placeholder="Till (ny text)"
+                                    value={mapping.params?.to || ''}
+                                    onChange={(e) => handleUpdateMappingParams(mapping.id, { to: e.target.value })}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs"
+                                  />
                                 </div>
+                              )}
+                              
+                              {currentTransforms.includes('regex') && (
+                                <div className="space-y-1 mb-1">
+                                  <input
+                                    type="text"
+                                    placeholder="Pattern (t.ex. ^(\d{8})(\d{4})$)"
+                                    value={mapping.params?.pattern || ''}
+                                    onChange={(e) => handleUpdateMappingParams(mapping.id, { pattern: e.target.value })}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs font-mono"
+                                  />
+                                  <input
+                                    type="text"
+                                    placeholder="Replacement (t.ex. $1-$2)"
+                                    value={mapping.params?.replacement || ''}
+                                    onChange={(e) => handleUpdateMappingParams(mapping.id, { replacement: e.target.value })}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs font-mono"
+                                  />
+                                </div>
+                              )}
+                              
+                              {currentTransforms.includes('format') && (
+                                <div className="space-y-1 mb-1">
+                                  <input
+                                    type="text"
+                                    placeholder="Format-sträng (t.ex. {0}-{1}-{2})"
+                                    value={mapping.params?.format || ''}
+                                    onChange={(e) => handleUpdateMappingParams(mapping.id, { format: e.target.value })}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs"
+                                  />
+                                  <input
+                                    type="text"
+                                    placeholder="Dela vid positioner (t.ex. 4,6)"
+                                    value={mapping.params?.split_at || ''}
+                                    onChange={(e) => handleUpdateMappingParams(mapping.id, { split_at: e.target.value })}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs"
+                                  />
+                                </div>
+                              )}
+                              
+                              {currentTransforms.includes('default') && (
+                                <input
+                                  type="text"
+                                  placeholder="Standardvärde"
+                                  value={mapping.params?.defaultValue || ''}
+                                  onChange={(e) => handleUpdateMappingParams(mapping.id, { defaultValue: e.target.value })}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-xs mb-1"
+                                />
                               )}
                             </div>
                           );
                         })}
                         {childMappings.length === 0 && (
                           <div className="text-slate-500 text-sm italic">
-                            Inga fältmappningar - dra fält från {container.repeating_element?.tag}
+                            Inga fältmappningar - dra fält från {sourceElemName}
                           </div>
                         )}
                       </div>
@@ -1632,12 +1915,141 @@ const SchemaMapper = () => {
                 <p className="text-xs">(XSD eller XML)</p>
               </div>
             ) : (
-              targetSchema.fields.map(field => {
+              <>
+                {/* Repeating Elements Section */}
+                {targetSchema.repeating_elements && targetSchema.repeating_elements.length > 0 && (
+                  <div className="mb-4">
+                    <div className="text-xs font-semibold text-pink-400 mb-2 flex items-center gap-2">
+                      <Repeat className="w-4 h-4" />
+                      Upprepande element ({targetSchema.repeating_elements.length})
+                    </div>
+                    {targetSchema.repeating_elements.map((repElem, idx) => {
+                      const isExpanded = expandedRepeatingElements[`target-${repElem.path}`];
+                      const container = mappings.find(m => 
+                        m.is_container && m.target_wrapper_path === repElem.wrapper_path
+                      );
+                      
+                      return (
+                        <div key={`target-rep-${idx}`} className="mb-2">
+                          <div
+                            onDragOver={!processing ? handleDragOver : undefined}
+                            onDrop={!processing ? (e) => {
+                              e.preventDefault();
+                              if (draggedField && draggedField.repeatingElement) {
+                                const sourceRep = draggedField.repeatingElement;
+                                const newContainer = {
+                                  id: `container-${Date.now()}`,
+                                  source: [],
+                                  target: repElem.id || `tgt-rep-${idx}`,
+                                  aggregation: 'repeat',
+                                  loop_element_path: sourceRep.path,
+                                  target_wrapper_path: repElem.wrapper_path || repElem.path,
+                                  is_container: true,
+                                  transforms: [],
+                                  params: {}
+                                };
+                                setMappings(prev => [...prev, newContainer]);
+                              }
+                            } : undefined}
+                            className={`bg-slate-700 hover:bg-slate-600 p-3 rounded transition cursor-pointer ${
+                              container ? 'border-l-4 border-pink-500' : ''
+                            }`}
+                          >
+                            <div className="flex items-center mb-2">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setExpandedRepeatingElements(prev => ({
+                                    ...prev,
+                                    [`target-${repElem.path}`]: !prev[`target-${repElem.path}`]
+                                  }));
+                                }}
+                                className="text-pink-400 hover:text-pink-300 transition mr-2 flex-shrink-0"
+                                title="Visa/dölj barn-element"
+                              >
+                                {isExpanded ? '▼' : '▶'}
+                              </button>
+                              <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0 mr-2" title="Upprepande element" />
+                              <div className="flex-1 min-w-0">
+                                <div className="font-medium text-sm text-green-300 mb-1 truncate flex items-center gap-2" title={repElem.name}>
+                                  {repElem.name}
+                                  <span className="text-xs bg-pink-600 px-2 py-0.5 rounded">{repElem.maxOccurs || repElem.count || 'unbounded'}</span>
+                                </div>
+                                <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
+                                  {repElem.path}
+                                </div>
+                              </div>
+                            </div>
+                            {container && (
+                              <div className="text-xs text-pink-400 flex items-center gap-1 ml-10">
+                                <span>✓</span> Mappad från {container.loop_element_path?.split('/').pop()}
+                              </div>
+                            )}
+                          </div>
+                          
+                          {/* Child Fields */}
+                          {isExpanded && repElem.fields && repElem.fields.length > 0 && (
+                            <div className="ml-6 mt-2 space-y-1 border-l-2 border-pink-500 pl-3">
+                              {repElem.fields.map((childField, cidx) => {
+                                const childFieldObj = {
+                                  id: childField.id || `tgt-child-${idx}-${cidx}`,
+                                  name: childField.name,
+                                  path: childField.path,
+                                  type: childField.type || 'string',
+                                  parentRepeating: repElem.path
+                                };
+                                const fieldMappings = getMappingsForTarget(childFieldObj.id);
+                                
+                                return (
+                                  <div
+                                    key={cidx}
+                                    onDragOver={!processing ? handleDragOver : undefined}
+                                    onDrop={!processing ? (e) => handleDrop(e, childFieldObj) : undefined}
+                                    className={`bg-slate-700 hover:bg-slate-600 p-2 rounded text-xs transition cursor-pointer ${
+                                      fieldMappings.length > 0 ? 'border-l-2 border-green-500' : ''
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex-1 min-w-0">
+                                        <div className="text-green-200 truncate">{childFieldObj.name}</div>
+                                        <div className="text-slate-500 font-mono truncate">{childField.relative_path || childField.path}</div>
+                                      </div>
+                                      <span className="text-slate-500 ml-2">{childFieldObj.type}</span>
+                                    </div>
+                                    {fieldMappings.length > 0 && (
+                                      <div className="text-green-400 mt-1">✓ Mappad</div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                
+                {/* Regular Fields */}
+                {targetSchema.fields.map(field => {
                 const fieldMappings = getMappingsForTarget(field.id);
                 const isHovered = hoveredTarget === field.id;
                 const fullPath = field.path || field.name;
                 
-                // Check if this is a potential repeating target (look for matching source repeating element)
+                // Skip if this field is part of any repeating element
+                const isPartOfRepeating = targetSchema.repeating_elements?.some(r => 
+                  fullPath.startsWith(r.path + '/') || fullPath === r.path
+                );
+                
+                if (isPartOfRepeating) {
+                  return null; // Already shown in repeating elements section
+                }
+                
+                // NEW: Check if field is repeatable
+                const isRepeatable = field.repeatable || field.maxOccurs === 'unbounded' || 
+                  (field.maxOccurs && parseInt(field.maxOccurs) > 1);
+                
+                // Check if this is a potential repeating target
                 const isPotentialRepeating = sourceSchema?.repeating_elements?.some(r => 
                   r.tag.toLowerCase() === field.name.toLowerCase() || 
                   r.path.split('/').pop().toLowerCase() === field.name.toLowerCase()
@@ -1669,8 +2081,13 @@ const SchemaMapper = () => {
                           <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0" title="Kan vara upprepande wrapper" />
                         )}
                         <div className="flex-1 min-w-0">
-                          <div className="font-medium text-sm text-green-300 mb-1 truncate" title={field.name}>
+                          <div className="font-medium text-sm text-green-300 mb-1 truncate flex items-center gap-2" title={field.name}>
                             {field.name}
+                            {isRepeatable && (
+                              <span className="text-xs bg-pink-600 px-2 py-0.5 rounded" title={`maxOccurs: ${field.maxOccurs || 'unbounded'}`}>
+                                Upprepningsbar
+                              </span>
+                            )}
                           </div>
                           <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
                             {fullPath}
@@ -1697,13 +2114,14 @@ const SchemaMapper = () => {
                     )}
                   </div>
                 );
-              })
+              })}
+              </>
             )}
           </div>
         </div>
       </div>
 
-      {/* Modals */}
+      {/* Constant Modal */}
       {showConstantModal && (
         <div 
           className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
@@ -1764,7 +2182,7 @@ const SchemaMapper = () => {
         </div>
       )}
 
-
+      {/* Preview Modal */}
       {showPreview && previewData && (
         <div 
           className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
@@ -1776,7 +2194,12 @@ const SchemaMapper = () => {
           >
             <div className="p-4 border-b border-slate-700 flex items-center justify-between">
               <h3 className="text-lg font-semibold">Preview</h3>
-              <button onClick={() => setShowPreview(false)}>✕</button>
+              <button
+                onClick={() => setShowPreview(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
             </div>
             <div className="flex-1 overflow-auto p-4 grid grid-cols-2 gap-4">
               <div>
@@ -1796,6 +2219,7 @@ const SchemaMapper = () => {
         </div>
       )}
 
+      {/* Logs Modal */}
       {showLogs && (
         <div 
           className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
@@ -1810,17 +2234,24 @@ const SchemaMapper = () => {
               <div className="flex gap-2">
                 <button
                   onClick={downloadLogs}
-                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm"
+                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm flex items-center gap-1"
                 >
-                  <Download className="w-4 h-4 inline" /> Ladda ner
+                  <Download className="w-4 h-4" />
+                  Ladda ner
                 </button>
                 <button
                   onClick={clearLogs}
-                  className="px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-sm"
+                  className="px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-sm flex items-center gap-1"
                 >
-                  <Trash2 className="w-4 h-4 inline" /> Rensa
+                  <Trash2 className="w-4 h-4" />
+                  Rensa
                 </button>
-                <button onClick={() => setShowLogs(false)}>✕</button>
+                <button
+                  onClick={() => setShowLogs(false)}
+                  className="text-slate-400 hover:text-white"
+                >
+                  ✕
+                </button>
               </div>
             </div>
             <div className="flex-1 overflow-auto p-4">
@@ -1834,6 +2265,7 @@ const SchemaMapper = () => {
                       className={`p-3 rounded text-xs ${
                         log.level === 'error' ? 'bg-red-900 bg-opacity-30' :
                         log.level === 'success' ? 'bg-green-900 bg-opacity-30' :
+                        log.level === 'warn' ? 'bg-yellow-900 bg-opacity-30' :
                         'bg-slate-700'
                       }`}
                     >
