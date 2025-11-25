@@ -1052,29 +1052,40 @@ def apply_transform(value: str, transform: str, params: Dict[str, Any]) -> str:
     elif transform == 'replace':
         from_val = params.get('from_', params.get('from', ''))
         to_val = params.get('to', '')
-        
-        if len(from_val) > MAX_REGEX_LENGTH:
+
+        # Debug logging
+        print(f"  [TRANSFORM DEBUG] Replace params: from_='{from_val}' (type: {type(from_val).__name__}), to='{to_val}'")
+
+        # Ensure strings (not None)
+        if from_val is None:
+            from_val = ''
+        if to_val is None:
+            to_val = ''
+
+        if from_val and len(from_val) > MAX_REGEX_LENGTH:
             print(f"  [TRANSFORM ERROR] 'from' value too long")
             return value
-        
+
         if from_val:
-            return value.replace(from_val, to_val)
+            result = value.replace(from_val, to_val)
+            print(f"  [TRANSFORM] Replace: '{value}' → '{result}'")
+            return result
         return value
     
     elif transform == 'regex':
-        pattern = params.get('pattern', '')
-        replacement = params.get('replacement', '')
-        
-        if len(pattern) > MAX_REGEX_LENGTH:
+        pattern = params.get('pattern', '') or ''
+        replacement = params.get('replacement', '') or ''
+
+        if pattern and len(pattern) > MAX_REGEX_LENGTH:
             print(f"  [TRANSFORM ERROR] Regex pattern too long")
             return value
-        
+
         if pattern:
             try:
                 python_replacement = replacement
                 for i in range(10):
                     python_replacement = python_replacement.replace(f'${i}', f'\\{i}')
-                
+
                 return re.sub(pattern, python_replacement, value)
             except Exception as e:
                 print(f"  [TRANSFORM ERROR] Regex failed: {e}")
@@ -1082,10 +1093,10 @@ def apply_transform(value: str, transform: str, params: Dict[str, Any]) -> str:
         return value
     
     elif transform == 'format':
-        format_string = params.get('format', '')
+        format_string = params.get('format', '') or ''
         if format_string:
             try:
-                split_at = params.get('split_at', '')
+                split_at = params.get('split_at', '') or ''
                 if split_at:
                     positions = [int(x.strip()) for x in split_at.split(',')]
                     parts = []
@@ -1103,10 +1114,10 @@ def apply_transform(value: str, transform: str, params: Dict[str, Any]) -> str:
         return value
     
     elif transform == 'default':
-        return value if value else params.get('defaultValue', '')
-    
+        return value if value else (params.get('defaultValue', '') or '')
+
     elif transform == 'sanitize':
-        allowed_chars = params.get('allowed_chars', 'a-zA-Z0-9\\s\\-_.,')
+        allowed_chars = params.get('allowed_chars', 'a-zA-Z0-9\\s\\-_.,') or 'a-zA-Z0-9\\s\\-_.,'
         pattern = f'[^{allowed_chars}]'
         return re.sub(pattern, '', value)
     
