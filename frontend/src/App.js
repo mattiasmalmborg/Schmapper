@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo, useRef } from 'react';
-import { Download, Upload, Play, Trash2, Plus, Database, Eye, Save, FileText, AlertCircle, Repeat, Link, ChevronDown, ChevronRight, X } from 'lucide-react';
+import { Download, Upload, Play, Trash2, Plus, Database, Eye, Save, FileText, AlertCircle, Repeat } from 'lucide-react';
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
 
@@ -77,6 +77,18 @@ const SchemaMapper = () => {
     console.log(`[${level.toUpperCase()}] ${message}`, data || '');
   }, []);
 
+  const showNotification = useCallback((message, type = 'success') => {
+    if (notificationTimeoutRef.current) {
+      clearTimeout(notificationTimeoutRef.current);
+    }
+
+    setNotification({ message: sanitizeInput(message), type });
+    notificationTimeoutRef.current = setTimeout(() => {
+      setNotification(null);
+      notificationTimeoutRef.current = null;
+    }, NOTIFICATION_TIMEOUT);
+  }, []);
+
   const downloadLogs = useCallback(() => {
     try {
       const logText = logs.map(log => 
@@ -97,12 +109,12 @@ const SchemaMapper = () => {
       addLog('error', 'Failed to download logs', { error: error.message });
       showNotification('Kunde inte ladda ner logg', 'error');
     }
-  }, [logs]);
+  }, [logs, addLog, showNotification]);
 
   const clearLogs = useCallback(() => {
     setLogs([]);
     showNotification('Loggar rensade');
-  }, []);
+  }, [showNotification]);
 
   const transforms = useMemo(() => [
     { id: 'none', name: 'Direkt', icon: '→' },
@@ -121,18 +133,6 @@ const SchemaMapper = () => {
     { id: 'repeat', name: 'Repetera (1:n)', description: 'Ett målelement per upprepning i källan', icon: <Repeat className="w-3 h-3" /> },
     { id: 'merge', name: 'Slå ihop alla', description: 'Alla källvärden i samma målelement' }
   ], []);
-
-  const showNotification = useCallback((message, type = 'success') => {
-    if (notificationTimeoutRef.current) {
-      clearTimeout(notificationTimeoutRef.current);
-    }
-    
-    setNotification({ message: sanitizeInput(message), type });
-    notificationTimeoutRef.current = setTimeout(() => {
-      setNotification(null);
-      notificationTimeoutRef.current = null;
-    }, NOTIFICATION_TIMEOUT);
-  }, []);
 
   const createConstant = useCallback(() => {
     const sanitizedName = sanitizeInput(constantName.trim());
@@ -172,18 +172,6 @@ const SchemaMapper = () => {
     addLog('info', `Constant deleted: ${constId}`);
     showNotification('Konstant borttagen');
   }, [addLog, showNotification]);
-
-  // Helper to check if a source field belongs to a repeating element
-  const getRepeatingElementForField = useCallback((fieldPath) => {
-    if (!sourceSchema?.repeating_elements) return null;
-    
-    for (const elem of sourceSchema.repeating_elements) {
-      if (fieldPath.startsWith(elem.path + '/')) {
-        return elem;
-      }
-    }
-    return null;
-  }, [sourceSchema]);
 
   // Helper to get repeating container mapping
   const getRepeatingContainerForElement = useCallback((elemPath) => {
@@ -354,7 +342,6 @@ const SchemaMapper = () => {
   }, [loadSchema, showNotification, addLog]);
 
   const handleDragStart = useCallback((e, field, type) => {
-    console.log('[DRAG START]', { field, type });
     e.dataTransfer.effectAllowed = 'copy';
     setDraggedField({ ...field, type });
   }, []);
@@ -367,8 +354,6 @@ const SchemaMapper = () => {
   const handleDrop = useCallback((e, targetField) => {
     e.preventDefault();
     e.stopPropagation();
-    
-    console.log('[DROP]', { draggedField, targetField });
     
     if (!draggedField) return;
     
@@ -427,20 +412,10 @@ const SchemaMapper = () => {
     // Handle regular field or constant
     if (draggedField.type === 'source' || draggedField.type === 'constant') {
       // Check if source field is from repeating element
-      const sourceField = draggedField.type === 'source' ? sourceSchema?.fields.find(f => f.id === draggedField.id) : null;
       const parentRepeating = draggedField.parentRepeating;
       const repContainer = parentRepeating ? getRepeatingContainerForElement(parentRepeating) : null;
 
-      console.log('[DROP DEBUG]', {
-        draggedFieldId: draggedField.id,
-        parentRepeating,
-        hasContainer: !!repContainer,
-        targetField: targetField.name,
-        targetRepeatable: targetField.repeatable,
-        targetMaxOccurs: targetField.maxOccurs
-      });
-
-      // NEW: Check if target is a repeatable field (for repeat-to-single)
+      // Check if target is a repeatable field (for repeat-to-single)
       // Check both field properties AND if it exists in repeating_elements
       let isTargetRepeatable = targetField.repeatable || targetField.maxOccurs === 'unbounded' || 
         (targetField.maxOccurs && parseInt(targetField.maxOccurs) > 1);
@@ -452,20 +427,14 @@ const SchemaMapper = () => {
         );
         if (targetAsRepeating) {
           isTargetRepeatable = true;
-          console.log('[DROP DEBUG] Target found in repeating_elements:', targetAsRepeating);
         }
       }
-      
-      console.log('[DROP DEBUG] isTargetRepeatable:', isTargetRepeatable, 'will create repeat-to-single:', parentRepeating && isTargetRepeatable && !repContainer);
-      
-      // NEW: If source is from repeating element AND target is repeatable field, create/use repeat-to-single container
+
+      // If source is from repeating element AND target is repeatable field, create/use repeat-to-single container
       if (parentRepeating && isTargetRepeatable && !repContainer) {
-        console.log('[DROP DEBUG] Creating repeat-to-single container...');
         // Need to create a repeat-to-single container first
         const sourceRepElem = sourceSchema?.repeating_elements?.find(r => r.path === parentRepeating);
-        
-        console.log('[DROP DEBUG] sourceRepElem:', sourceRepElem);
-        
+
         if (sourceRepElem) {
           // Create repeat-to-single container
           const newContainer = {
@@ -569,7 +538,7 @@ const SchemaMapper = () => {
     
     setDraggedField(null);
     setHoveredTarget(null);
-  }, [draggedField, mappings, sourceSchema, getRepeatingContainerForElement, addLog, showNotification]);
+  }, [draggedField, mappings, sourceSchema, targetSchema, getRepeatingContainerForElement, addLog, showNotification]);
 
   const handleDropOnMapping = useCallback((e, mappingId) => {
     e.preventDefault();
@@ -624,20 +593,6 @@ const SchemaMapper = () => {
     
     showNotification('Mappning borttagen');
   }, [mappings, selectedMapping, addLog, showNotification]);
-
-  const handleRemoveSourceFromMapping = useCallback((mappingId, sourceId) => {
-    setMappings(prev => prev.map(m => {
-      if (m.id === mappingId) {
-        const newSource = m.source.filter(s => s !== sourceId);
-        if (newSource.length === 0) {
-          return null;
-        }
-        return { ...m, source: newSource };
-      }
-      return m;
-    }).filter(Boolean));
-    addLog('info', 'Source removed from mapping');
-  }, [addLog]);
 
   const handleUpdateMappingTransforms = useCallback((mappingId, transforms) => {
     setMappings(prev => prev.map(m =>
@@ -1213,9 +1168,7 @@ const SchemaMapper = () => {
                     {sourceSchema.repeating_elements.map((repeatingElem, idx) => {
                       const container = getRepeatingContainerForElement(repeatingElem.path);
                       const isExpanded = expandedRepeatingElements[repeatingElem.path];
-                      
-                      console.log('[REPEATING ELEM]', repeatingElem.tag, 'container:', container?.id, 'isExpanded:', isExpanded);
-                      
+
                       return (
                         <div key={`repeat-${idx}`} className="mb-2">
                           <div
@@ -1271,9 +1224,7 @@ const SchemaMapper = () => {
                                 const isChildMapped = getAllMappedSourceIds.has(childField.id);
                                 // NEW: Always draggable (for repeat-to-single support)
                                 const isDraggable = !processing;
-                                
-                                console.log('[CHILD FIELD]', childFieldObj.name, 'container:', !!container, 'draggable:', isDraggable);
-                                
+
                                 return (
                                   <div
                                     key={childIdx}

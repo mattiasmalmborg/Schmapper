@@ -12,11 +12,10 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional
 import pandas as pd
 import lxml.etree as ET
 from pathlib import Path
-import json
 import re
 import io
 import uuid
