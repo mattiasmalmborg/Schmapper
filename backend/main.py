@@ -1,17 +1,6 @@
-# backend/main.py - FIXED VERSION v3.1
-# Preserves ALL mapping modes:
-# 1. Normal field-to-field mappings
-# 2. Wrapper-to-wrapper repeating mappings (NORMAL mode)
-# 3. Repeat-to-single mappings (no wrapper)
-#
-# Fixes:
-# - Element ordering based on schema sequence
-# - Improved path matching for source data
-# - Repeat-to-single elements inserted at correct position
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import lxml.etree as ET
@@ -30,6 +19,7 @@ ALLOWED_FILE_EXTENSIONS = {'.csv', '.xsd', '.xml'}
 MAX_BATCH_FILES = 100000
 
 ROOT_DIRECTORY = os.environ.get('SCHMAPPER_ROOT_DIR', None)
+DEBUG = os.environ.get('SCHMAPPER_DEBUG', 'False').lower() == 'true'
 
 app = FastAPI()
 
@@ -73,6 +63,12 @@ class MappingParams(BaseModel):
     allowed_chars: Optional[str] = None
     mergeSeparator: Optional[str] = None
 
+class MappingCondition(BaseModel):
+    """Condition for filtering which source elements to map"""
+    field: str  # Which field to check: "@name", "value", "@dataType", etc.
+    operator: str  # "equals", "contains", "startswith", "regex", "exists"
+    value: Optional[str] = None  # Value to compare against (not needed for "exists")
+
 class Mapping(BaseModel):
     id: str
     source: List[str]
@@ -88,6 +84,64 @@ class Mapping(BaseModel):
     child_mappings: Optional[List[str]] = []
     parent_repeat_container: Optional[str] = None
     repeat_to_single: Optional[bool] = False
+    conditions: Optional[List[MappingCondition]] = None  # Filter conditions for conditional mapping
+
+    @model_validator(mode='before')
+    @classmethod
+    def extract_params_from_transforms(cls, data):
+        """Extract params from transform objects BEFORE field validation
+
+        Frontend sends: transforms=[{id, type, params}, ...]
+        We need to:
+        1. Extract params from each transform object
+        2. Merge them into the params field
+        3. Convert transform objects to strings
+
+        This runs before all field validators so we have access to raw transform objects.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        transforms = data.get('transforms', [])
+        params = data.get('params', {})
+
+        # Initialize params dict if needed
+        if params is None:
+            params = {}
+        elif not isinstance(params, dict):
+            params = {}
+
+        # Extract params from transform objects
+        if transforms and isinstance(transforms, list):
+            if DEBUG:
+                print(f"[MODEL VALIDATOR] Processing {len(transforms)} transforms")
+
+            converted_transforms = []
+            for i, item in enumerate(transforms):
+                if isinstance(item, dict):
+                    # Extract type for transforms list
+                    transform_type = item.get('type', '')
+                    converted_transforms.append(transform_type)
+
+                    # Extract params and merge
+                    if 'params' in item and isinstance(item['params'], dict):
+                        if DEBUG:
+                            print(f"[MODEL VALIDATOR] Transform {i} ({transform_type}): merging params {item['params']}")
+                        params.update(item['params'])
+                else:
+                    # Already a string
+                    converted_transforms.append(item)
+
+            # Update transforms with converted list
+            data['transforms'] = converted_transforms
+
+        # Update params
+        data['params'] = params
+
+        if DEBUG:
+            print(f"[MODEL VALIDATOR] Final params: {params}")
+
+        return data
 
 class Constant(BaseModel):
     id: str
@@ -170,27 +224,30 @@ def sanitize_xpath(xpath: str) -> str:
 def deduplicate_fields(fields: List[Dict]) -> List[Dict]:
     seen_paths = {}
     unique_fields = []
-    
+
     for field in fields:
         path = field.get('path', field.get('name', ''))
-        
+
         if path not in seen_paths:
             seen_paths[path] = True
             unique_fields.append(field)
-        else:
+        elif DEBUG:
             print(f"  [DEDUP] Removing duplicate: {path}")
-    
-    print(f"[DEDUP] {len(fields)} → {len(unique_fields)} unique fields")
+
+    if DEBUG:
+        print(f"[DEDUP] {len(fields)} -> {len(unique_fields)} unique fields")
     return unique_fields
 
 
-def extract_namespace(root: ET._Element) -> tuple:
+def extract_namespace(root: ET._Element) -> str:
+    """Extract namespace from root element tag."""
     tag = root.tag
     if '}' in tag:
         ns_uri = tag.split('}')[0].strip('{')
-        print(f"[NAMESPACE] Detected namespace: {ns_uri}")
-        return ns_uri, None
-    return None, None
+        if DEBUG:
+            print(f"[NAMESPACE] Detected namespace: {ns_uri}")
+        return ns_uri
+    return None
 
 
 # ============================================================================
@@ -286,9 +343,10 @@ class ElementOrderTracker:
         self.field_paths = [e['path'] for e in all_elements]
         self._path_to_index = {path: i for i, path in enumerate(self.field_paths)}
 
-        print(f"[ORDER TRACKER] Initialized with {len(self.field_paths)} paths (sorted by XSD order)")
-        for i, e in enumerate(all_elements[:25]):
-            print(f"  {i}: {e['path']} (order={e['order']})")
+        if DEBUG:
+            print(f"[ORDER TRACKER] Initialized with {len(self.field_paths)} paths (sorted by XSD order)")
+            for i, e in enumerate(all_elements[:25]):
+                print(f"  {i}: {e['path']} (order={e['order']})")
     
     def get_order_index(self, path: str) -> int:
         """Get the schema-defined order index for a path."""
@@ -461,7 +519,7 @@ def extract_sample_data(element: ET._Element) -> Dict:
 
 @app.get("/")
 async def root():
-    return {"message": "Schmapper Backend API", "version": "3.1 (Fixed Element Ordering + All Mapping Modes)"}
+    return {"message": "Schmapper Backend API"}
 
 
 @app.post("/api/parse-csv-schema")
@@ -497,7 +555,8 @@ async def parse_csv_schema(file: UploadFile = File(...)):
                 "type": "string",
                 "path": path,
                 "repeatable": False,
-                "maxOccurs": "1"
+                "maxOccurs": "1",
+                "order": idx  # Preserve column order from CSV
             })
         
         fields = deduplicate_fields(fields)
@@ -519,15 +578,16 @@ async def parse_xml_as_source(content: bytes, filename: str):
         validate_file_size(content, MAX_XML_SIZE)
         parser = create_safe_xml_parser()
         root = ET.fromstring(content, parser=parser)
-        
-        namespace, _ = extract_namespace(root)
-        
+
+        namespace = extract_namespace(root)
+
         xsd_ns = 'http://www.w3.org/2001/XMLSchema'
         
         fields = []
         idx = 0
         named_types = {}
-        
+        element_order = [0]  # Use list to allow modification in nested function
+
         is_xsd = root.tag.endswith('schema') or xsd_ns in root.tag
         
         if is_xsd:
@@ -552,6 +612,8 @@ async def parse_xml_as_source(content: bytes, filename: str):
                         child_name = child_elem.get('name')
                         child_type = child_elem.get('type', 'string')
                         if child_name:
+                            current_order = element_order[0]
+                            element_order[0] += 1
                             field_id = f"field-{base_path.replace('/', '-')}-{child_name}"
                             extracted_fields.append({
                                 'id': field_id,
@@ -559,17 +621,21 @@ async def parse_xml_as_source(content: bytes, filename: str):
                                 'relative_path': f"./{child_name}",
                                 'type': child_type.split(':')[-1] if ':' in child_type else child_type,
                                 'tag': child_name,
-                                'name': child_name
+                                'name': child_name,
+                                'order': current_order
                             })
                 return extracted_fields
             
             def process_element(elem, path_so_far):
                 nonlocal idx
-                
+
+                current_order = element_order[0]
+                element_order[0] += 1
+
                 name = elem.get('name')
                 if not name:
                     return
-                
+
                 current_path = f"{path_so_far}/{name}" if path_so_far else name
                 
                 inline_ct = elem.find(f'{{{xsd_ns}}}complexType')
@@ -610,7 +676,14 @@ async def parse_xml_as_source(content: bytes, filename: str):
                         type_def = named_types.get(clean_type)
                         if type_def is not None:
                             repeating_info['fields'] = extract_fields_from_complex_type(current_path, type_def)
-                    
+
+                    # Sort fields by order to ensure correct XSD sequence
+                    if repeating_info.get('fields'):
+                        repeating_info['fields'] = sorted(
+                            repeating_info['fields'],
+                            key=lambda f: f.get('order', 999999)
+                        )
+
                     repeating_elements_info.append(repeating_info)
                 elif is_repeatable(elem):
                     print(f"[SOURCE XSD] Found repeatable FIELD (no wrapper): {current_path}")
@@ -627,7 +700,8 @@ async def parse_xml_as_source(content: bytes, filename: str):
                             "type": type_ref.split(':')[-1] if type_ref else "string",
                             "path": current_path,
                             "repeatable": False,
-                            "maxOccurs": "1"
+                            "maxOccurs": "1",
+                            "order": current_order
                         })
                         idx += 1
                 elif type_ref:
@@ -646,7 +720,8 @@ async def parse_xml_as_source(content: bytes, filename: str):
                                 "type": clean_type,
                                 "path": current_path,
                                 "repeatable": False,
-                                "maxOccurs": "1"
+                                "maxOccurs": "1",
+                                "order": current_order
                             })
                             idx += 1
                     else:
@@ -656,7 +731,8 @@ async def parse_xml_as_source(content: bytes, filename: str):
                             "type": clean_type,
                             "path": current_path,
                             "repeatable": False,
-                            "maxOccurs": "1"
+                            "maxOccurs": "1",
+                            "order": current_order
                         })
                         idx += 1
                 else:
@@ -666,7 +742,8 @@ async def parse_xml_as_source(content: bytes, filename: str):
                         "type": "string",
                         "path": current_path,
                         "repeatable": False,
-                        "maxOccurs": "1"
+                        "maxOccurs": "1",
+                        "order": current_order
                     })
                     idx += 1
             
@@ -683,16 +760,19 @@ async def parse_xml_as_source(content: bytes, filename: str):
             
             def extract_fields_from_data(elem, path=""):
                 nonlocal idx
-                
+
+                current_order = element_order[0]
+                element_order[0] += 1
+
                 tag = elem.tag
                 if '}' in tag:
                     tag = tag.split('}')[1]
-                
+
                 current_path = f"{path}/{tag}" if path else tag
-                
+
                 has_text = elem.text and elem.text.strip()
                 has_children = len(elem) > 0
-                
+
                 if has_text and not has_children:
                     fields.append({
                         "id": f"src-{idx}",
@@ -700,7 +780,8 @@ async def parse_xml_as_source(content: bytes, filename: str):
                         "type": "string",
                         "path": current_path,
                         "repeatable": False,
-                        "maxOccurs": "1"
+                        "maxOccurs": "1",
+                        "order": current_order
                     })
                     idx += 1
                 
@@ -777,6 +858,8 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                     child_name = child_elem.get('name')
                     child_type = child_elem.get('type', 'string')
                     if child_name:
+                        current_order = element_order[0]
+                        element_order[0] += 1
                         field_id = f"field-{base_path.replace('/', '-')}-{child_name}"
                         extracted_fields.append({
                             'id': field_id,
@@ -784,25 +867,79 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                             'relative_path': f"./{child_name}",
                             'type': child_type.split(':')[-1] if ':' in child_type else child_type,
                             'tag': child_name,
-                            'name': child_name
+                            'name': child_name,
+                            'order': current_order  # Assign XSD sequence order
                         })
             return extracted_fields
 
-        def process_element(elem, path_so_far):
+        # Maximum recursion depth to prevent infinite loops from circular references
+        MAX_RECURSION_DEPTH = 15  # Lowered - true recursion detection handles the rest
+
+        def process_element(elem, path_so_far, depth=0, visited_types=None):
+            """
+            Process XSD element with TRUE recursion detection.
+
+            Args:
+                elem: XML element to process
+                path_so_far: Current path in XSD hierarchy
+                depth: Current nesting depth
+                visited_types: Set of type names already visited in current path chain.
+                              When same type appears again = recursion detected.
+            """
             nonlocal idx
+
+            # Initialize visited_types on first call
+            if visited_types is None:
+                visited_types = set()
+
+            # Prevent infinite recursion from circular schema references (fallback)
+            if depth > MAX_RECURSION_DEPTH:
+                print(f"[TARGET XSD] WARNING: Max recursion depth ({MAX_RECURSION_DEPTH}) reached at path: {path_so_far}")
+                return
+
             current_order = element_order[0]
             element_order[0] += 1
-            
+
             name = elem.get('name')
             if not name:
                 return
-            
+
             current_path = f"{path_so_far}/{name}" if path_so_far else name
             max_occurs = elem.get('maxOccurs', '1')
             is_field_repeatable = max_occurs == 'unbounded' or (max_occurs.isdigit() and int(max_occurs) > 1)
-            
+
             inline_ct = elem.find(f'{{{xsd_ns}}}complexType')
             type_ref = elem.get('type')
+
+            # === TRUE RECURSION DETECTION ===
+            current_type_name = None
+            if type_ref:
+                current_type_name = type_ref.split(':')[-1]
+            elif inline_ct is not None:
+                # For inline complexTypes, use a unique identifier based on element name
+                current_type_name = f"inline:{name}"
+
+            # Check if this type was already visited in this path chain
+            if current_type_name and current_type_name in visited_types:
+                print(f"[TARGET XSD] RECURSIVE TYPE detected: {current_type_name} at {current_path}")
+                fields.append({
+                    "id": f"tgt-{idx}",
+                    "name": name,
+                    "type": current_type_name,
+                    "path": current_path,
+                    "repeatable": is_field_repeatable,
+                    "maxOccurs": max_occurs,
+                    "order": current_order,
+                    "isRecursive": True,  # Frontend uses this to show ↻ icon
+                    "recursiveType": current_type_name  # Which type is recursive
+                })
+                idx += 1
+                return  # STOP - don't expand this type further to avoid infinite loop
+
+            # Create new visited set including current type for children
+            new_visited = visited_types.copy()
+            if current_type_name:
+                new_visited.add(current_type_name)
             
             # CRITICAL: Check if element has complex content (child elements)
             # Only elements WITH children should be treated as repeating WRAPPERS
@@ -835,7 +972,7 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                     'sample_data': {},
                     'order': current_order  # Track XSD sequence order
                 }
-                
+
                 if inline_ct is not None:
                     repeating_info['fields'] = extract_fields_from_complex_type(current_path, inline_ct)
                 elif type_ref:
@@ -843,18 +980,27 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                     type_def = named_types.get(clean_type)
                     if type_def is not None:
                         repeating_info['fields'] = extract_fields_from_complex_type(current_path, type_def)
-                
+
+                # Sort fields by order to ensure correct XSD sequence
+                if repeating_info.get('fields'):
+                    repeating_info['fields'] = sorted(
+                        repeating_info['fields'],
+                        key=lambda f: f.get('order', 999999)
+                    )
+
                 repeating_elements_info.append(repeating_info)
                 print(f"[TARGET XSD] Repeatable wrapper has {len(repeating_info['fields'])} child fields")
+                # Don't return - continue processing to find nested repeating elements
+                # We'll use path-based deduplication to avoid duplicates in the main fields array
             elif is_field_repeatable:
                 # This is a repeatable FIELD (no children) - NOT a wrapper
                 print(f"[TARGET XSD] Found repeatable FIELD (no wrapper): {current_path} (maxOccurs={max_occurs})")
-            
+
             if inline_ct is not None:
                 seq = inline_ct.find(f'{{{xsd_ns}}}sequence')
                 if seq is not None:
                     for child_elem in seq.findall(f'{{{xsd_ns}}}element'):
-                        process_element(child_elem, current_path)
+                        process_element(child_elem, current_path, depth + 1, new_visited)
                 else:
                     clean_type = type_ref.split(':')[-1] if type_ref else "string"
                     fields.append({
@@ -875,7 +1021,7 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                     seq = type_def.find(f'{{{xsd_ns}}}sequence')
                     if seq is not None:
                         for child_elem in seq.findall(f'{{{xsd_ns}}}element'):
-                            process_element(child_elem, current_path)
+                            process_element(child_elem, current_path, depth + 1, new_visited)
                     else:
                         fields.append({
                             "id": f"tgt-{idx}",
@@ -912,16 +1058,35 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
         
         root_elements = root.findall(f'{{{xsd_ns}}}element[@name]')
         print(f"[TARGET XSD] Found {len(root_elements)} root elements")
-        
+
         for root_elem in root_elements:
-            process_element(root_elem, "")
+            process_element(root_elem, "", depth=0, visited_types=set())
         
         print(f"[TARGET XSD] Parsed {len(fields)} fields before dedup")
+        print(f"[TARGET XSD] Fields BEFORE dedup:")
+        for f in fields[:20]:
+            print(f"  - {f['path']}")
+
         fields = deduplicate_fields(fields)
-        
+
+        print(f"[TARGET XSD] Fields AFTER dedup ({len(fields)} total):")
+        for f in fields[:20]:
+            print(f"  - {f['path']}")
+
+        # Filter out fields that are part of repeating wrapper elements
+        # These should only be accessible through the repeating_elements structure
+        repeating_paths = {rep['path'] for rep in repeating_elements_info}
+        fields_before_filter = len(fields)
+        fields = [f for f in fields if not any(f['path'].startswith(rep_path + '/') or f['path'] == rep_path for rep_path in repeating_paths)]
+        if fields_before_filter != len(fields):
+            print(f"[TARGET XSD] Filtered out {fields_before_filter - len(fields)} fields that are part of repeating wrappers")
+
+        print(f"[TARGET XSD] Final field count: {len(fields)}")
         print(f"[TARGET XSD] Found {len(repeating_elements_info)} repeatable elements")
         for rep in repeating_elements_info:
             print(f"  - {rep['path']} (maxOccurs={rep['maxOccurs']}, {len(rep['fields'])} fields)")
+            for child_field in rep['fields']:
+                print(f"    > {child_field['path']}")
         
         repeatable_fields = [f for f in fields if f.get('repeatable')]
         print(f"[TARGET XSD] Found {len(repeatable_fields)} repeatable fields (for repeat-to-single)")
@@ -1053,8 +1218,8 @@ def apply_transform(value: str, transform: str, params: Dict[str, Any]) -> str:
         from_val = params.get('from_', params.get('from', ''))
         to_val = params.get('to', '')
 
-        # Debug logging
-        print(f"  [TRANSFORM DEBUG] Replace params: from_='{from_val}' (type: {type(from_val).__name__}), to='{to_val}'")
+        if DEBUG:
+            print(f"  [TRANSFORM DEBUG] Replace params: from_='{from_val}' (type: {type(from_val).__name__}), to='{to_val}'")
 
         # Ensure strings (not None)
         if from_val is None:
@@ -1068,7 +1233,8 @@ def apply_transform(value: str, transform: str, params: Dict[str, Any]) -> str:
 
         if from_val:
             result = value.replace(from_val, to_val)
-            print(f"  [TRANSFORM] Replace: '{value}' → '{result}'")
+            if DEBUG:
+                print(f"  [TRANSFORM] Replace: '{value}' -> '{result}'")
             return result
         return value
     
@@ -1153,7 +1319,8 @@ def apply_mappings_to_row(row: Dict, mappings: List[Mapping], source_schema: Sch
     print(f"[MAPPING] Applying {len(mappings)} mappings")
     
     for mapping in mappings:
-        if mapping.is_container:
+        # Skip container mappings and child mappings (those with parent_repeat_container)
+        if mapping.is_container or mapping.parent_repeat_container:
             continue
         
         source_values = []
@@ -1214,7 +1381,7 @@ def apply_mappings_to_row(row: Dict, mappings: List[Mapping], source_schema: Sch
                 old_value = value
                 value = apply_transform(value, transform, mapping.params.dict())
                 if old_value != value:
-                    print(f"  [TRANSFORM] {transform}: '{old_value}' → '{value}'")
+                    print(f"  [TRANSFORM] {transform}: '{old_value}' -> '{value}'")
         
         target_field = target_fields_by_id.get(mapping.target)
         if target_field:
@@ -1230,9 +1397,9 @@ def apply_mappings_to_row(row: Dict, mappings: List[Mapping], source_schema: Sch
             validated_value = validate_and_transform_value(value, field_type, field_name)
             result[field_path] = validated_value
             if validated_value:
-                print(f"  → TARGET: {field_name} = '{validated_value}'")
+                print(f"  -> TARGET: {field_name} = '{validated_value}'")
             else:
-                print(f"  → TARGET: {field_name} = <empty>")
+                print(f"  -> TARGET: {field_name} = <empty>")
         else:
             print(f"  [WARNING] Target field not found: {mapping.target}")
     
@@ -1270,17 +1437,24 @@ def create_xml_from_data(
                 repeating_wrapper_paths.add(wrapper_path)
     
     print(f"[XML CREATE] Skipping {len(repeating_wrapper_paths)} repeating wrapper paths")
-    
+
+    # Sort fields by their XSD order before processing
+    sorted_fields = sorted(schema.fields, key=lambda f: getattr(f, 'order', 999999))
+
     # Process fields in schema order
-    for field in schema.fields:
+    for field in sorted_fields:
         path_parts = field.path.split('/')
         value = data.get(field.path, '')
         
         is_repeatable = getattr(field, 'repeatable', False) or getattr(field, 'maxOccurs', '1') == 'unbounded'
-        is_in_repeating_wrapper = any(field.path.startswith(wrapper_path + '/') or field.path == wrapper_path 
+        is_in_repeating_wrapper = any(field.path.startswith(wrapper_path + '/') or field.path == wrapper_path
                                        for wrapper_path in repeating_wrapper_paths)
-        
+
         if is_in_repeating_wrapper:
+            continue
+
+        # Skip fields without values (don't create empty elements)
+        if not value:
             continue
         
         for i in range(len(path_parts)):
@@ -1367,20 +1541,20 @@ def parse_xml_to_dict(xml_content: bytes) -> Dict[str, str]:
             has_children = len(elem) > 0
             
             if has_text and not has_children:
-                # Store with FULL path
+                # Store with FULL path (always)
                 result[current_path] = elem.text.strip()
-                
-                # Store with partial paths
+
+                # Store with partial paths (always overwrite to get most recent)
+                # This allows flexible matching while avoiding ambiguity from first-match
+                # BUT skip single-part paths (bare tag names) to avoid ambiguity
                 parts = current_path.split('/')
-                for i in range(len(parts)):
+                for i in range(1, len(parts) - 1):  # Stop before creating bare tag name
                     partial = '/'.join(parts[i:])
-                    if partial not in result:
-                        result[partial] = elem.text.strip()
-                
-                # Store with just tag name
-                if tag not in result:
-                    result[tag] = elem.text.strip()
-                
+                    result[partial] = elem.text.strip()
+
+                # DO NOT store bare tag name to avoid ambiguity with duplicate tag names
+                # PathMatcher will use full paths and partial paths for matching
+
                 print(f"  [PARSE] {current_path} = '{elem.text.strip()}'")
             
             for child in elem:
@@ -1401,6 +1575,73 @@ def parse_xml_to_dict(xml_content: bytes) -> Dict[str, str]:
 
 
 # ============================================================================
+# CONDITIONAL MAPPING - EVALUATE CONDITIONS ON ELEMENTS
+# ============================================================================
+
+def evaluate_condition(condition: MappingCondition, element_data: Dict[str, str]) -> bool:
+    """
+    Evaluate a single condition against element data.
+
+    Args:
+        condition: The condition to evaluate
+        element_data: Dictionary with element attributes and values
+                     Keys can be: "@name", "@dataType", "value", "property", etc.
+
+    Returns:
+        True if condition matches, False otherwise
+    """
+    field_value = element_data.get(condition.field, "")
+
+    if condition.operator == "exists":
+        # Check if field exists and is not empty
+        return condition.field in element_data and element_data[condition.field] != ""
+
+    if condition.operator == "equals":
+        return field_value == condition.value
+
+    if condition.operator == "contains":
+        return condition.value in field_value
+
+    if condition.operator == "startswith":
+        return field_value.startswith(condition.value)
+
+    if condition.operator == "regex":
+        try:
+            if len(condition.value) > MAX_REGEX_LENGTH:
+                print(f"[CONDITION] Regex too long: {len(condition.value)}")
+                return False
+            return bool(re.match(condition.value, field_value))
+        except Exception as e:
+            print(f"[CONDITION] Regex error: {e}")
+            return False
+
+    # Unknown operator
+    print(f"[CONDITION] Unknown operator: {condition.operator}")
+    return False
+
+
+def evaluate_conditions(conditions: List[MappingCondition], element_data: Dict[str, str]) -> bool:
+    """
+    Evaluate all conditions (AND logic).
+
+    Args:
+        conditions: List of conditions to evaluate
+        element_data: Dictionary with element attributes and values
+
+    Returns:
+        True if ALL conditions match, False if any fails
+    """
+    if not conditions:
+        return True  # No conditions = always match
+
+    for condition in conditions:
+        if not evaluate_condition(condition, element_data):
+            return False
+
+    return True
+
+
+# ============================================================================
 # REPEATING MAPPINGS - ALL MODES PRESERVED + CORRECT ORDERING
 # ============================================================================
 
@@ -1415,8 +1656,8 @@ def apply_repeating_mappings_to_xml(
 ) -> int:
     """
     Apply repeating element mappings with ALL modes preserved:
-    1. NORMAL mode: wrapper-to-wrapper (repeating source → repeating target wrapper)
-    2. REPEAT-TO-SINGLE mode: repeating source → repeatable target field (no wrapper)
+    1. NORMAL mode: wrapper-to-wrapper (repeating source -> repeating target wrapper)
+    2. REPEAT-TO-SINGLE mode: repeating source -> repeatable target field (no wrapper)
     
     FIXED: Elements are now inserted at correct position based on schema order.
     """
@@ -1424,8 +1665,9 @@ def apply_repeating_mappings_to_xml(
     
     # Create element order tracker for correct positioning
     order_tracker = ElementOrderTracker(target_schema)
-    
-    container_mappings = [m for m in mappings if m.is_container and m.aggregation == 'repeat']
+
+    # Process ALL container mappings (repeat, merge, first, last)
+    container_mappings = [m for m in mappings if m.is_container]
     
     for container in container_mappings:
         if not container.loop_element_path:
@@ -1485,14 +1727,230 @@ def apply_repeating_mappings_to_xml(
             print(f"[REPEAT] Target fields lookup: {len(target_fields_by_id)} fields")
             
             constants_by_id = {c.id: c for c in (constants or [])}
-            
+
+            # Determine aggregation mode
+            aggregation_mode = container.aggregation or 'repeat'
+            print(f"[REPEAT] Aggregation mode: {aggregation_mode}")
+
+            # Get merge separator if in merge mode
+            merge_separator = getattr(container.params, 'mergeSeparator', ', ') if container.params and aggregation_mode == 'merge' else ', '
+
+            # Filter loop elements based on aggregation mode
+            elements_to_process = loop_elements
+            if aggregation_mode == 'first':
+                elements_to_process = [loop_elements[0]] if loop_elements else []
+                print(f"[REPEAT] Using FIRST element only")
+            elif aggregation_mode == 'last':
+                elements_to_process = [loop_elements[-1]] if loop_elements else []
+                print(f"[REPEAT] Using LAST element only")
+            elif aggregation_mode == 'merge':
+                # For merge, we'll collect all values from all elements and combine them
+                print(f"[REPEAT] Will MERGE all {len(loop_elements)} elements with separator: '{merge_separator}'")
+
             # Determine mode
             has_wrapper = container.target_wrapper_path is not None
-            is_repeat_to_single = container.repeat_to_single or not has_wrapper
-            
+            # In merge mode, always treat as repeat-to-single (no wrapper creation)
+            is_repeat_to_single = aggregation_mode == 'merge' or container.repeat_to_single or not has_wrapper
+
             print(f"[REPEAT] Mode: {'REPEAT-TO-SINGLE' if is_repeat_to_single else 'NORMAL (with wrapper)'}")
-            
-            for idx, loop_elem in enumerate(loop_elements):
+
+            # Special handling for MERGE mode
+            if aggregation_mode == 'merge':
+                # Collect all values from all instances for each child mapping
+                merged_values = {}  # mapping_id -> [values from all instances]
+
+                for idx, loop_elem in enumerate(loop_elements):
+                    print(f"\n[MERGE] Collecting values from instance {idx + 1}/{len(loop_elements)}")
+
+                    # Extract data from this source instance
+                    instance_data = {}
+
+                    def extract_from_element(elem, path=""):
+                        tag = elem.tag
+                        if '}' in tag:
+                            tag = tag.split('}')[1]
+
+                        current_path = f"{path}/{tag}" if path else tag
+
+                        if elem.text and elem.text.strip():
+                            instance_data[current_path] = elem.text.strip()
+                            # Also store with partial path variations for flexible matching
+                            # But DON'T store bare tag names to avoid ambiguity
+                            parts = current_path.split('/')
+                            for i in range(1, len(parts) - 1):  # Stop before creating bare tag name
+                                partial = '/'.join(parts[i:])
+                                instance_data[partial] = elem.text.strip()
+
+                        for attr, val in elem.attrib.items():
+                            instance_data[f"{current_path}/@{attr}"] = val
+                            # Store attribute with partial paths but not bare tag
+                            parts = current_path.split('/')
+                            for i in range(1, len(parts) - 1):  # Stop before creating bare tag name
+                                partial = '/'.join(parts[i:])
+                                instance_data[f"{partial}/@{attr}"] = val
+
+                        for child in elem:
+                            extract_from_element(child, current_path)
+
+                    extract_from_element(loop_elem, "")
+
+                    # Collect values for each child mapping
+                    for mapping in child_mappings:
+                        source_values = []
+
+                        for src_id in mapping.source:
+                            if src_id.startswith('const-'):
+                                const = constants_by_id.get(src_id)
+                                value = const.value if const else ''
+                            else:
+                                source_field = source_fields_by_id.get(src_id)
+                                if not source_field:
+                                    continue
+
+                                field_name = source_field.get('name', '') if isinstance(source_field, dict) else source_field.name
+                                field_path = source_field.get('path', '') if isinstance(source_field, dict) else source_field.path
+
+                                # Use improved path matcher
+                                value = path_matcher.find_value(instance_data, field_path, field_name)
+                                if value is None:
+                                    value = ''
+
+                            source_values.append(str(value))
+
+                        # Apply transforms
+                        transforms_to_apply = mapping.transforms if mapping.transforms else ([mapping.transform] if mapping.transform else [])
+
+                        if 'concat' in transforms_to_apply:
+                            separator = mapping.params.separator if mapping.params.separator is not None else ' '
+                            value = separator.join(source_values)
+                            transforms_to_apply = [t for t in transforms_to_apply if t != 'concat']
+                        else:
+                            value = source_values[0] if source_values else ''
+
+                        for transform in transforms_to_apply:
+                            if transform and transform != 'none':
+                                value = apply_transform(value, transform, mapping.params.dict())
+
+                        # Store value for this instance
+                        if mapping.id not in merged_values:
+                            merged_values[mapping.id] = []
+                        if value:  # Only add non-empty values
+                            merged_values[mapping.id].append(value)
+
+                # Now create ONE target element with all merged values
+                print(f"\n[MERGE] Creating single target element with merged values")
+
+                wrapper_elem = None
+                target_parts = []
+
+                if has_wrapper and not is_repeat_to_single:
+                    target_parts = container.target_wrapper_path.strip('/').split('/')
+                    print(f"  [MERGE] Navigating wrapper path: {target_parts}")
+
+                    current = target_root
+                    root_tag = target_root.tag.split('}')[-1] if '}' in target_root.tag else target_root.tag
+
+                    start_idx = 1 if len(target_parts) > 0 and target_parts[0] == root_tag else 0
+
+                    for i in range(start_idx, len(target_parts) - 1):
+                        part = target_parts[i]
+                        child = None
+                        for c in current:
+                            c_tag = c.tag.split('}')[-1] if '}' in c.tag else c.tag
+                            if c_tag == part:
+                                child = c
+                                break
+
+                        if child is None:
+                            child = ET.Element(part)
+                            current.append(child)
+
+                        current = child
+
+                    # Create wrapper element at correct position
+                    final_tag = target_parts[-1]
+                    parent_path = '/'.join(target_parts[:-1]) if len(target_parts) > 1 else ""
+                    insert_idx = order_tracker.get_insertion_index(current, final_tag, parent_path)
+                    wrapper_elem = ET.Element(final_tag)
+                    current.insert(insert_idx, wrapper_elem)
+                    total_instances += 1
+                    print(f"  [MERGE] Created wrapper: {final_tag} at index {insert_idx}")
+                else:
+                    wrapper_elem = target_root
+                    print(f"  [MERGE] Using root as wrapper")
+
+                # Apply merged values to target fields
+                for mapping in child_mappings:
+                    values = merged_values.get(mapping.id, [])
+                    if not values:
+                        continue
+
+                    # Combine all values with the merge separator
+                    combined_value = merge_separator.join(values)
+                    print(f"  [MERGE] Mapping {mapping.id}: {len(values)} values -> '{combined_value[:50]}...'")
+
+                    # Get target field
+                    target_field = target_fields_by_id.get(mapping.target)
+                    if target_field:
+                        field_type = target_field.get('type', 'string') if isinstance(target_field, dict) else target_field.type
+                        field_name = target_field.get('name', '') if isinstance(target_field, dict) else target_field.name
+                        field_path = target_field.get('path', '') if isinstance(target_field, dict) else target_field.path
+
+                        validated_value = validate_and_transform_value(combined_value, field_type, field_name)
+
+                        if is_repeat_to_single:
+                            # REPEAT-TO-SINGLE: Insert at correct position
+                            target_path_parts = field_path.split('/')
+
+                            current_elem = target_root
+                            current_path = target_root.tag.split('}')[-1] if '}' in target_root.tag else target_root.tag
+
+                            # Navigate/create path to parent
+                            root_tag = current_path
+                            start_idx = 1 if len(target_path_parts) > 0 and target_path_parts[0] == root_tag else 0
+
+                            for i in range(start_idx, len(target_path_parts) - 1):
+                                part = target_path_parts[i]
+
+                                # Find existing child
+                                child = None
+                                for c in current_elem:
+                                    c_tag = c.tag.split('}')[-1] if '}' in c.tag else c.tag
+                                    if c_tag == part:
+                                        child = c
+                                        break
+
+                                if child is None:
+                                    # Create at correct position
+                                    insert_idx = order_tracker.get_insertion_index(current_elem, part, current_path)
+                                    child = ET.Element(part)
+                                    current_elem.insert(insert_idx, child)
+
+                                current_path = f"{current_path}/{part}"
+                                current_elem = child
+
+                            # Create final element at correct position
+                            final_tag = target_path_parts[-1]
+                            parent_path = '/'.join(target_path_parts[:-1])
+                            insert_idx = order_tracker.get_insertion_index(current_elem, final_tag, parent_path)
+                            target_elem = ET.Element(final_tag)
+                            target_elem.text = validated_value
+                            current_elem.insert(insert_idx, target_elem)
+                            print(f"  [MERGE] Created {final_tag} = '{validated_value[:50]}...' at index {insert_idx}")
+                        else:
+                            # NORMAL mode: Add to wrapper
+                            final_tag = field_name
+                            insert_idx = order_tracker.get_insertion_index(wrapper_elem, final_tag, '/'.join(target_parts))
+                            target_elem = ET.Element(final_tag)
+                            target_elem.text = validated_value
+                            wrapper_elem.insert(insert_idx, target_elem)
+                            print(f"  [MERGE] Added {final_tag} = '{validated_value[:50]}...' at index {insert_idx}")
+
+                # Skip the regular loop since we've handled merge mode
+                continue
+
+            # Regular processing for repeat/first/last modes
+            for idx, loop_elem in enumerate(elements_to_process):
                 print(f"\n[REPEAT] Processing instance {idx + 1}/{len(loop_elements)}")
                 
                 # Extract data from this source instance
@@ -1502,22 +1960,58 @@ def apply_repeating_mappings_to_xml(
                     tag = elem.tag
                     if '}' in tag:
                         tag = tag.split('}')[1]
-                    
+
                     current_path = f"{path}/{tag}" if path else tag
-                    
+
                     if elem.text and elem.text.strip():
                         instance_data[current_path] = elem.text.strip()
-                        instance_data[tag] = elem.text.strip()
-                    
+                        # Also store with partial path variations for flexible matching
+                        # But DON'T store bare tag names to avoid ambiguity
+                        parts = current_path.split('/')
+                        for i in range(1, len(parts) - 1):  # Stop before creating bare tag name
+                            partial = '/'.join(parts[i:])
+                            instance_data[partial] = elem.text.strip()
+
                     for attr, val in elem.attrib.items():
                         instance_data[f"{current_path}/@{attr}"] = val
-                        instance_data[f"{tag}/@{attr}"] = val
-                    
+                        # Store attribute with partial paths but not bare tag
+                        parts = current_path.split('/')
+                        for i in range(1, len(parts) - 1):  # Stop before creating bare tag name
+                            partial = '/'.join(parts[i:])
+                            instance_data[f"{partial}/@{attr}"] = val
+
                     for child in elem:
                         extract_from_element(child, current_path)
                 
                 extract_from_element(loop_elem, "")
-                
+
+                # ============================================================
+                # CHECK CONDITIONS - Skip if conditions don't match
+                # ============================================================
+                if container.conditions:
+                    # Build element_data dict with attributes and child values
+                    element_data = {}
+
+                    # Add attributes from the loop element itself
+                    for attr, val in loop_elem.attrib.items():
+                        element_data[f"@{attr}"] = val
+
+                    # Add child element values (like <value>Anna</value>)
+                    for child in loop_elem:
+                        child_tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                        if child.text and child.text.strip():
+                            element_data[child_tag] = child.text.strip()
+
+                    # Check if conditions match
+                    if not evaluate_conditions(container.conditions, element_data):
+                        print(f"  [CONDITION] Skipping instance {idx + 1} - conditions not met")
+                        print(f"  [CONDITION] Element data: {element_data}")
+                        print(f"  [CONDITION] Required conditions: {[(c.field, c.operator, c.value) for c in container.conditions]}")
+                        continue
+                    else:
+                        print(f"  [CONDITION] Instance {idx + 1} matches conditions")
+                        print(f"  [CONDITION] Element data: {element_data}")
+
                 wrapper_elem = None
                 target_parts = []
                 
@@ -1767,15 +2261,28 @@ async def batch_process(request: BatchProcessRequest):
                         
                         if request.folder_naming == "guid":
                             folder_name = str(uuid.uuid4())
-                        else:
-                            if request.folder_naming_fields:
-                                name_parts = []
-                                for field_path in request.folder_naming_fields:
-                                    value = transformed.get(field_path, '')
-                                    name_parts.append(str(value))
-                                folder_name = '_'.join(name_parts).replace(' ', '_')
+                        elif request.folder_naming == "filename":
+                            folder_name = csv_file.stem
+                        elif request.folder_naming_fields:
+                            # Build name->path map for target fields
+                            target_name_to_path = {}
+                            for f in request.target_schema.fields:
+                                target_name_to_path[f.name] = f.path
+
+                            name_parts = []
+                            for field_name in request.folder_naming_fields:
+                                # Convert field name to path
+                                field_path = target_name_to_path.get(field_name, field_name)
+                                value = transformed.get(field_path, '')
+                                if value:
+                                    name_parts.append(str(value).replace(' ', '_').replace('/', '_').replace('\\', '_'))
+
+                            if name_parts:
+                                folder_name = '_'.join(name_parts)
                             else:
                                 folder_name = str(uuid.uuid4())
+                        else:
+                            folder_name = str(uuid.uuid4())
                         
                         output_folder = target_path / folder_name
                         output_folder.mkdir(parents=True, exist_ok=True)
@@ -1831,15 +2338,26 @@ async def batch_process(request: BatchProcessRequest):
                         folder_name = str(uuid.uuid4())
                     elif request.folder_naming == "filename":
                         folder_name = xml_file.stem
-                    else:
-                        if request.folder_naming_fields:
-                            name_parts = []
-                            for field_path in request.folder_naming_fields:
-                                value = transformed.get(field_path, '')
-                                name_parts.append(str(value))
-                            folder_name = '_'.join(name_parts).replace(' ', '_')
+                    elif request.folder_naming_fields:
+                        # Build name->path map for target fields
+                        target_name_to_path = {}
+                        for f in request.target_schema.fields:
+                            target_name_to_path[f.name] = f.path
+
+                        name_parts = []
+                        for field_name in request.folder_naming_fields:
+                            # Convert field name to path
+                            field_path = target_name_to_path.get(field_name, field_name)
+                            value = transformed.get(field_path, '')
+                            if value:
+                                name_parts.append(str(value).replace(' ', '_').replace('/', '_').replace('\\', '_'))
+
+                        if name_parts:
+                            folder_name = '_'.join(name_parts)
                         else:
                             folder_name = str(uuid.uuid4())
+                    else:
+                        folder_name = str(uuid.uuid4())
                     
                     output_folder = target_path / folder_name
                     output_folder.mkdir(parents=True, exist_ok=True)

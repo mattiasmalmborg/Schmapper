@@ -39,8 +39,10 @@ Thumbs.db
 # Testing
 coverage/
 .pytest_cache/
+analyze_schemas.py
 
 VersionHistory/
+Schemas/
 
 #claude
 CLAUDE.md

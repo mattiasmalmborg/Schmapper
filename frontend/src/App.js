@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo, useRef } from 'react';
-import { Download, Upload, Play, Trash2, Plus, Database, Save, FileText, AlertCircle, Repeat, Moon, Sun, Settings, Edit } from 'lucide-react';
+import { Download, Upload, Play, Trash2, Plus, Database, Save, FileText, AlertCircle, Repeat, Moon, Sun, Settings, Edit, ArrowRight } from 'lucide-react';
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
 
@@ -52,6 +52,14 @@ const SchemaMapper = () => {
   const [lightMode, setLightMode] = useState(false);
   const [showTransformModal, setShowTransformModal] = useState(false);
   const [currentMappingForTransform, setCurrentMappingForTransform] = useState(null);
+  const [editingTransform, setEditingTransform] = useState(null);
+  const [transformParams, setTransformParams] = useState({});
+  const [editingInstanceId, setEditingInstanceId] = useState(null);
+
+  // Condition Editor States
+  const [showConditionModal, setShowConditionModal] = useState(false);
+  const [currentMappingForCondition, setCurrentMappingForCondition] = useState(null);
+  const [editingConditions, setEditingConditions] = useState([]);
 
   // Refs
   const notificationTimeoutRef = useRef(null);
@@ -75,8 +83,10 @@ const SchemaMapper = () => {
       }
       return newLogs;
     });
-    
-    console.log(`[${level.toUpperCase()}] ${message}`, data || '');
+
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`[${level.toUpperCase()}] ${message}`, data || '');
+    }
   }, []);
 
   const showNotification = useCallback((message, type = 'success') => {
@@ -192,10 +202,9 @@ const SchemaMapper = () => {
 
   // Helper to get repeating container mapping
   const getRepeatingContainerForElement = useCallback((elemPath) => {
-    return mappings.find(m => 
-      m.aggregation === 'repeat' && 
-      m.loop_element_path === elemPath &&
-      m.is_container
+    return mappings.find(m =>
+      m.is_container &&
+      m.loop_element_path === elemPath
     );
   }, [mappings]);
 
@@ -632,32 +641,71 @@ const SchemaMapper = () => {
     showNotification('Mappning borttagen');
   }, [mappings, selectedMapping, addLog, showNotification]);
 
-  const handleUpdateMappingTransforms = useCallback((mappingId, transforms) => {
-    setMappings(prev => prev.map(m =>
-      m.id === mappingId ? { ...m, transforms } : m
-    ));
+  // Helper to normalize transforms to instance format
+  const normalizeTransforms = useCallback((transforms) => {
+    if (!transforms) return [];
+    return transforms.map(t => {
+      if (typeof t === 'string') {
+        return { id: `${t}-${Date.now()}-${Math.random()}`, type: t };
+      }
+      return t;
+    });
   }, []);
 
-  const handleUpdateMappingParams = useCallback((mappingId, params) => {
-    setMappings(prev => prev.map(m =>
-      m.id === mappingId ? { ...m, params: { ...m.params, ...params } } : m
-    ));
-  }, []);
+  // Helper to get transform instances for a mapping
+  const getTransformInstances = useCallback((mapping) => {
+    if (!mapping) return [];
+    let transforms = mapping.transforms || (mapping.transform && mapping.transform !== 'none' ? [mapping.transform] : []);
+    return normalizeTransforms(transforms);
+  }, [normalizeTransforms]);
 
-  const handleTransformChange = useCallback((mappingId, transformId) => {
+  // Add or update a transform instance
+  const saveTransformInstance = useCallback((mappingId, transformType, params = {}) => {
     setMappings(prev => prev.map(m => {
       if (m.id !== mappingId) return m;
-      
-      let currentTransforms = m.transforms || (m.transform && m.transform !== 'none' ? [m.transform] : []);
-      
-      let newTransforms;
-      if (currentTransforms.includes(transformId)) {
-        newTransforms = currentTransforms.filter(t => t !== transformId);
-      } else {
-        newTransforms = [...currentTransforms, transformId];
-      }
-      
-      return { ...m, transforms: newTransforms };
+
+      const instances = getTransformInstances(m);
+      const newInstance = {
+        id: `${transformType}-${Date.now()}-${Math.random()}`,
+        type: transformType,
+        params: Object.keys(params).length > 0 ? params : undefined
+      };
+
+      return { ...m, transforms: [...instances, newInstance] };
+    }));
+  }, [getTransformInstances]);
+
+  // Remove a transform instance
+  const removeTransformInstance = useCallback((mappingId, instanceId) => {
+    setMappings(prev => prev.map(m => {
+      if (m.id !== mappingId) return m;
+
+      const instances = getTransformInstances(m);
+      const newInstances = instances.filter(inst => inst.id !== instanceId);
+
+      return { ...m, transforms: newInstances };
+    }));
+  }, [getTransformInstances]);
+
+  // Update a transform instance's parameters
+  const updateTransformInstance = useCallback((mappingId, instanceId, params) => {
+    setMappings(prev => prev.map(m => {
+      if (m.id !== mappingId) return m;
+
+      const instances = getTransformInstances(m);
+      const newInstances = instances.map(inst =>
+        inst.id === instanceId ? { ...inst, params } : inst
+      );
+
+      return { ...m, transforms: newInstances };
+    }));
+  }, [getTransformInstances]);
+
+  // Save conditions to a mapping
+  const saveConditions = useCallback((mappingId, conditions) => {
+    setMappings(prev => prev.map(m => {
+      if (m.id !== mappingId) return m;
+      return { ...m, conditions: conditions && conditions.length > 0 ? conditions : null };
     }));
   }, []);
 
@@ -816,6 +864,7 @@ const SchemaMapper = () => {
             isParent: true,
             isRepeating: isRepeating,
             maxOccurs: repeatingInfo?.maxOccurs || repeatingInfo?.count,
+            order: repeatingInfo?.order || field.order, // Inherit order from repeating info or current field
             children: []
           };
 
@@ -868,7 +917,84 @@ const SchemaMapper = () => {
       }
     };
 
+    // Sort top-level tree by order
+    tree.sort((a, b) => {
+      if (a.order !== undefined && b.order !== undefined) {
+        return a.order - b.order;
+      }
+      const nameA = a.name || '';
+      const nameB = b.name || '';
+      return nameA.localeCompare(nameB);
+    });
+
+    // Sort all children recursively
     tree.forEach(sortChildren);
+
+    // After building the tree, add nested repeating elements as children
+    // This handles cases where a field like "Handlingar" contains a nested repeating element "Handling"
+    if (schema.repeating_elements) {
+      schema.repeating_elements.forEach(repElem => {
+        const repPath = repElem.path;
+        const pathParts = repPath.split('/').filter(p => p);
+
+        if (pathParts.length > 1) {
+          // Get parent path (e.g., "ArendeExport/Arenden/Arende/Handlingar" for "ArendeExport/Arenden/Arende/Handlingar/Handling")
+          const parentPath = pathParts.slice(0, -1).join('/');
+          const parentNode = pathMap.get(parentPath);
+
+          // Check if this repeating element is not already in the tree
+          if (parentNode && !pathMap.has(repPath)) {
+            // Mark parent as having children so it's expandable
+            parentNode.isParent = true;
+
+            // Create node for the nested repeating element
+            const repNode = {
+              id: `repeating-${repPath}`,
+              name: pathParts[pathParts.length - 1],
+              path: repPath,
+              type: 'object',
+              isParent: true,
+              isRepeating: true,
+              maxOccurs: repElem.maxOccurs || repElem.count,
+              children: []
+            };
+
+            // Add fields from the repeating element as children
+            if (repElem.fields) {
+              repElem.fields.forEach(field => {
+                repNode.children.push({
+                  ...field,
+                  isParent: false,
+                  parentRepeatingPath: repPath,
+                  isInRepeating: true,
+                  children: []
+                });
+              });
+
+              // Sort children by order
+              sortChildren(repNode);
+            }
+
+            // Add the repeating element node as a child of its parent
+            parentNode.children.push(repNode);
+            pathMap.set(repPath, repNode);
+          }
+        }
+      });
+
+      // Sort children again after adding nested repeating elements
+      tree.forEach(sortChildren);
+    }
+
+
+    // Final pass: Ensure all nodes with children are marked as parents
+    const markParents = (node) => {
+      if (node.children && node.children.length > 0) {
+        node.isParent = true;
+        node.children.forEach(markParents);
+      }
+    };
+    tree.forEach(markParents);
 
     return tree;
   }, []);
@@ -903,6 +1029,7 @@ const SchemaMapper = () => {
     const isMapped = node.id && getAllMappedSourceIds.has(node.id);
     const hasChildren = node.children && node.children.length > 0;
     const isRepeating = node.isRepeating || node.maxOccurs === 'unbounded' || (node.maxOccurs && node.maxOccurs > 1);
+    const isRecursive = node.isRecursive === true;  // TRUE recursion detected by backend
 
     const toggleExpand = (e) => {
       e.stopPropagation();
@@ -923,9 +1050,9 @@ const SchemaMapper = () => {
                 handleDragStart(e, { repeatingElement: { path: node.path, name: node.name, fields: node.children } }, 'repeating-source');
               }
             }}
-            className={`group relative ${lightMode ? 'bg-gradient-to-r from-blue-50/60 to-blue-100/40 hover:from-blue-100/60 hover:to-blue-200/40 border border-blue-100 hover:border-blue-300 shadow-sm hover:shadow' : 'bg-gradient-to-r from-slate-700 to-slate-600 hover:from-slate-600 hover:to-slate-500 border border-slate-600 hover:border-blue-500'} p-2 rounded-lg mb-2 transition-all ${
+            className={`group relative ${lightMode ? 'bg-gradient-to-r from-blue-50/60 to-blue-100/40 hover:from-blue-100/60 hover:to-blue-200/40 border border-blue-100 hover:border-blue-300 shadow-sm hover:shadow' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-blue-500'} p-2 rounded-lg mb-2 transition-all ${
               isMapped ? 'border-l-4 border-l-emerald-500' : ''
-            }`}
+            } ${isRecursive ? 'border-l-4 border-l-orange-500' : ''}`}
           >
             <div className="flex items-center gap-2">
               <button
@@ -936,6 +1063,9 @@ const SchemaMapper = () => {
               </button>
               {isRepeating && (
                 <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0" title="Upprepande element" />
+              )}
+              {isRecursive && (
+                <span className="text-orange-500 text-base flex-shrink-0" title={`Rekursiv typ: ${node.recursiveType || node.type}`}>↻</span>
               )}
               <div className="flex-1 min-w-0">
                 <div className={`font-medium text-sm truncate flex items-center gap-2 ${lightMode ? 'text-gray-900' : 'text-white'}`} title={node.name}>
@@ -970,13 +1100,16 @@ const SchemaMapper = () => {
         <div
           draggable={!processing}
           onDragStart={(e) => handleDragStart(e, node, 'source')}
-          className={`group relative ${lightMode ? 'bg-gradient-to-r from-blue-50/60 to-blue-100/40 hover:from-blue-100/60 hover:to-blue-200/40 border border-blue-100 hover:border-blue-300 shadow-sm hover:shadow' : 'bg-gradient-to-r from-slate-700 to-slate-600 hover:from-slate-600 hover:to-slate-500 border border-slate-600 hover:border-blue-500'} p-2 rounded-lg mb-2 cursor-move transition-all ${
+          className={`group relative ${lightMode ? 'bg-gradient-to-r from-blue-50/60 to-blue-100/40 hover:from-blue-100/60 hover:to-blue-200/40 border border-blue-100 hover:border-blue-300 shadow-sm hover:shadow' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-blue-500'} p-2 rounded-lg mb-2 cursor-move transition-all ${
             isMapped ? 'border-l-4 border-l-emerald-500' : ''
-          }`}
+          } ${isRecursive ? 'border-l-4 border-l-orange-500' : ''}`}
         >
           <div className="flex items-center gap-2">
             {isRepeating && (
               <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0" title="Upprepande element" />
+            )}
+            {isRecursive && (
+              <span className="text-orange-500 text-base flex-shrink-0" title={`Rekursiv typ: ${node.recursiveType || node.type}`}>↻</span>
             )}
             <div className="flex-1 min-w-0">
               <div className={`font-medium text-sm truncate flex items-center gap-2 ${lightMode ? 'text-gray-900' : 'text-white'}`} title={node.name}>
@@ -1008,6 +1141,7 @@ const SchemaMapper = () => {
     const isHovered = hoveredTarget === node.id;
     const hasChildren = node.children && node.children.length > 0;
     const isRepeating = node.isRepeating || node.maxOccurs === 'unbounded' || (node.maxOccurs && node.maxOccurs > 1);
+    const isRecursive = node.isRecursive === true;  // TRUE recursion detected by backend
 
     const toggleExpand = (e) => {
       e.stopPropagation();
@@ -1041,9 +1175,9 @@ const SchemaMapper = () => {
                 setMappings(prev => [...prev, newContainer]);
               }
             } : undefined}
-            className={`group relative ${lightMode ? 'bg-gradient-to-r from-emerald-50/60 to-emerald-100/40 hover:from-emerald-100/60 hover:to-emerald-200/40 border border-emerald-100 hover:border-emerald-300 shadow-sm hover:shadow' : 'bg-gradient-to-r from-slate-700 to-slate-600 hover:from-slate-600 hover:to-slate-500 border border-slate-600 hover:border-green-500'} p-2 rounded-lg mb-2 transition-all ${
+            className={`group relative ${lightMode ? 'bg-gradient-to-r from-emerald-50/60 to-emerald-100/40 hover:from-emerald-100/60 hover:to-emerald-200/40 border border-emerald-100 hover:border-emerald-300 shadow-sm hover:shadow' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-green-500'} p-2 rounded-lg mb-2 transition-all ${
               fieldMappings.length > 0 ? 'border-l-4 border-l-emerald-500' : ''
-            }`}
+            } ${isRecursive ? 'border-l-4 border-l-orange-500' : ''}`}
           >
             <div className="flex items-center gap-2">
               <button
@@ -1054,6 +1188,9 @@ const SchemaMapper = () => {
               </button>
               {isRepeating && (
                 <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0" title="Upprepande element" />
+              )}
+              {isRecursive && (
+                <span className="text-orange-500 text-base flex-shrink-0" title={`Rekursiv typ: ${node.recursiveType || node.type}`}>↻</span>
               )}
               <div className="flex-1 min-w-0">
                 <div className={`font-medium text-sm truncate flex items-center gap-2 ${lightMode ? 'text-gray-900' : 'text-white'}`} title={node.name}>
@@ -1090,15 +1227,18 @@ const SchemaMapper = () => {
           onDrop={!processing ? (e) => handleDrop(e, node) : undefined}
           onDragEnter={() => !processing && setHoveredTarget(node.id)}
           onDragLeave={() => setHoveredTarget(null)}
-          className={`group relative ${lightMode ? 'bg-gradient-to-r from-emerald-50/60 to-emerald-100/40 hover:from-emerald-100/60 hover:to-emerald-200/40 border border-emerald-100 hover:border-emerald-300 shadow-sm hover:shadow' : 'bg-gradient-to-r from-slate-700 to-slate-600 hover:from-slate-600 hover:to-slate-500 border border-slate-600 hover:border-green-500'} p-2 rounded-lg mb-2 transition-all ${
+          className={`group relative ${lightMode ? 'bg-gradient-to-r from-emerald-50/60 to-emerald-100/40 hover:from-emerald-100/60 hover:to-emerald-200/40 border border-emerald-100 hover:border-emerald-300 shadow-sm hover:shadow' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-green-500'} p-2 rounded-lg mb-2 transition-all ${
             isHovered && !processing ? lightMode ? 'ring-2 ring-emerald-300' : 'ring-2 ring-green-400' : ''
           } ${
             fieldMappings.length > 0 ? 'border-l-4 border-l-emerald-500' : ''
-          }`}
+          } ${isRecursive ? 'border-l-4 border-l-orange-500' : ''}`}
         >
           <div className="flex items-center gap-2">
             {isRepeating && (
               <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0" title="Upprepande element" />
+            )}
+            {isRecursive && (
+              <span className="text-orange-500 text-base flex-shrink-0" title={`Rekursiv typ: ${node.recursiveType || node.type}`}>↻</span>
             )}
             <div className="flex-1 min-w-0">
               <div className={`font-medium text-sm truncate flex items-center gap-2 ${lightMode ? 'text-gray-900' : 'text-white'}`} title={node.name}>
@@ -1352,29 +1492,29 @@ const SchemaMapper = () => {
         <div className="absolute inset-0 bg-black bg-opacity-60 backdrop-blur-sm flex items-center justify-center z-40">
           <div className={`${lightMode ? 'bg-white' : 'bg-slate-800'} rounded-2xl p-8 flex flex-col items-center gap-4 shadow-2xl`}>
             <div className="animate-spin rounded-full h-12 w-12 border-4 border-purple-200 border-t-purple-600"></div>
-            <span className={`font-medium ${lightMode ? 'text-gray-900' : 'text-white'}`}>Loading schema...</span>
+            <span className={`font-medium ${lightMode ? 'text-gray-900' : 'text-white'}`}>Laddar schema...</span>
           </div>
         </div>
       )}
 
       {/* Header */}
-      <div className={`${lightMode ? 'bg-white border-gray-100 shadow-sm' : 'bg-gradient-to-r from-slate-800 to-slate-700 border-slate-700'} border-b px-6 py-4 flex items-center justify-between transition-colors`}>
-        <div className="flex items-center gap-4">
+      <div className={`${lightMode ? 'bg-gradient-to-r from-gray-100 to-gray-50 border-gray-200 shadow-sm' : 'bg-gradient-to-r from-slate-900 to-slate-800 border-slate-700'} border-b px-6 py-4 flex items-center justify-between transition-colors overflow-x-auto`} style={{ minWidth: '1300px' }}>
+        <div className="flex items-center gap-4 flex-shrink-0">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center flex-shrink-0">
               <Database className="w-6 h-6 text-white" />
             </div>
-            <div>
-              <h1 className={`text-lg font-semibold ${lightMode ? 'text-gray-900' : 'text-white'}`}>Schmapper</h1>
-              <p className={`text-xs ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>XML Schema Mapper</p>
+            <div className="flex-shrink-0">
+              <h1 className={`text-lg font-semibold whitespace-nowrap ${lightMode ? 'text-gray-900' : 'text-white'}`}>Schmapper</h1>
+              <p className={`text-xs whitespace-nowrap ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>XML Schema Mapper</p>
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           <button
             onClick={() => setLightMode(!lightMode)}
             className={`p-2.5 rounded-lg transition ${lightMode ? 'bg-gray-200 hover:bg-gray-300 text-gray-700' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`}
-            title={lightMode ? 'Dark Mode' : 'Light Mode'}
+            title={lightMode ? 'Mörkt läge' : 'Ljust läge'}
           >
             {lightMode ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
           </button>
@@ -1401,7 +1541,7 @@ const SchemaMapper = () => {
             onClick={saveMappingConfig}
             className={`px-3.5 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 disabled:opacity-50 ${lightMode ? 'bg-gray-100 hover:bg-gray-200 text-gray-700' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`}
             disabled={isLoading || processing || mappings.length === 0}
-            title="Save mapping configuration"
+            title="Spara mappningskonfiguration"
           >
             <Save className="w-4 h-4" />
             Spara config
@@ -1417,7 +1557,7 @@ const SchemaMapper = () => {
             }}
             className={`px-3.5 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 disabled:opacity-50 ${lightMode ? 'bg-gray-100 hover:bg-gray-200 text-gray-700' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`}
             disabled={isLoading || processing}
-            title="Clear all"
+            title="Rensa allt"
           >
             <Trash2 className="w-4 h-4" />
             Rensa allt
@@ -1438,10 +1578,10 @@ const SchemaMapper = () => {
       </div>
 
       {/* Path Configuration */}
-      <div className={`${lightMode ? 'bg-gray-50/50' : 'bg-gradient-to-r from-slate-800 to-slate-700'} px-6 py-3 transition-colors`}>
-        <div className="grid grid-cols-3 gap-4">
-          <div>
-            <label className={`text-xs font-medium mb-1.5 block ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Source Folder</label>
+      <div className={`${lightMode ? 'bg-gradient-to-r from-gray-100 to-gray-50' : 'bg-gradient-to-r from-slate-900 to-slate-800'} py-3 transition-colors overflow-x-auto`} style={{ minWidth: '1300px' }}>
+        <div className="flex gap-0 min-w-[1250px]">
+          <div className="flex-shrink-0 flex-grow basis-[450px] min-w-[400px] max-w-[550px] px-5">
+            <label className={`text-xs font-medium mb-1.5 block ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Källmapp</label>
             <input
               type="text"
               value={sourcePath}
@@ -1451,8 +1591,8 @@ const SchemaMapper = () => {
               disabled={processing}
             />
           </div>
-          <div>
-            <label className={`text-xs font-medium mb-1.5 block ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Target Folder</label>
+          <div className="flex-1 min-w-[500px] px-6">
+            <label className={`text-xs font-medium mb-1.5 block ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Målmapp</label>
             <input
               type="text"
               value={targetPath}
@@ -1463,39 +1603,127 @@ const SchemaMapper = () => {
             />
           </div>
           {sourceSchema && (
-            <div>
-              <label className={`text-xs font-medium mb-1.5 block ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Folder Structure</label>
+            <div className="flex-shrink-0 flex-grow basis-[450px] min-w-[400px] max-w-[550px] px-5">
+              <label className={`text-xs font-medium mb-1.5 block ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Mappstruktur</label>
               <button
                 onClick={() => setShowFolderSettings(!showFolderSettings)}
                 className={`w-full px-3 py-2 rounded-lg text-sm text-left flex items-center justify-between transition ${lightMode ? 'bg-white hover:bg-gray-50 border border-gray-300 text-gray-900' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white'}`}
                 disabled={processing}
               >
-                <span>{folderNaming === 'guid' ? '🎲 GUID' : `📋 Field-based`}</span>
+                <span>
+                  {folderNaming === 'guid' && '🎲 GUID'}
+                  {folderNaming === 'field' && '📋 Fältbaserad'}
+                  {folderNaming === 'filename' && '📄 Källfilens namn'}
+                </span>
                 <span className={lightMode ? 'text-gray-400' : 'text-slate-400'}>{showFolderSettings ? '▲' : '▼'}</span>
               </button>
+              {showFolderSettings && (
+                <div className={`mt-2 p-3 rounded-lg border ${lightMode ? 'bg-white border-gray-200' : 'bg-slate-800 border-slate-700'}`}>
+                  <div className="space-y-2">
+                    <button
+                      onClick={() => {
+                        setFolderNaming('guid');
+                        setFolderNamingFields([]);
+                      }}
+                      className={`w-full text-left px-3 py-2 rounded text-sm transition ${
+                        folderNaming === 'guid'
+                          ? lightMode ? 'bg-blue-100 text-blue-900 font-medium' : 'bg-blue-900 text-blue-100 font-medium'
+                          : lightMode ? 'hover:bg-gray-100 text-gray-700' : 'hover:bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      🎲 GUID (Unika ID per fil)
+                    </button>
+                    <button
+                      onClick={() => setFolderNaming('field')}
+                      className={`w-full text-left px-3 py-2 rounded text-sm transition ${
+                        folderNaming === 'field'
+                          ? lightMode ? 'bg-blue-100 text-blue-900 font-medium' : 'bg-blue-900 text-blue-100 font-medium'
+                          : lightMode ? 'hover:bg-gray-100 text-gray-700' : 'hover:bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      📋 Fältbaserad (Välj fält nedan)
+                    </button>
+                    <button
+                      onClick={() => {
+                        setFolderNaming('filename');
+                        setFolderNamingFields([]);
+                      }}
+                      className={`w-full text-left px-3 py-2 rounded text-sm transition ${
+                        folderNaming === 'filename'
+                          ? lightMode ? 'bg-blue-100 text-blue-900 font-medium' : 'bg-blue-900 text-blue-100 font-medium'
+                          : lightMode ? 'hover:bg-gray-100 text-gray-700' : 'hover:bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      📄 Källfilens namn
+                    </button>
+                    {folderNaming === 'field' && targetSchema && (
+                      <div className={`mt-2 p-2 rounded ${lightMode ? 'bg-gray-50' : 'bg-slate-900'}`}>
+                        <label className={`text-xs font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>
+                          Välj målfält för mappnamn:
+                        </label>
+                        <select
+                          multiple
+                          value={folderNamingFields}
+                          onChange={(e) => {
+                            const selected = Array.from(e.target.selectedOptions).map(o => o.value);
+                            setFolderNamingFields(selected);
+                          }}
+                          className={`w-full px-2 py-1.5 rounded text-xs border ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-800 border-slate-600 text-white'}`}
+                          size={Math.min(5, (() => {
+                            const mappedTargetIds = new Set();
+                            mappings.forEach(m => {
+                              if (m.target) {
+                                mappedTargetIds.add(m.target);
+                              }
+                            });
+                            return targetSchema.fields.filter(f => mappedTargetIds.has(f.id)).length;
+                          })())}
+                        >
+                          {(() => {
+                            const mappedTargetIds = new Set();
+                            mappings.forEach(m => {
+                              if (m.target) {
+                                mappedTargetIds.add(m.target);
+                              }
+                            });
+                            return targetSchema.fields.filter(f => mappedTargetIds.has(f.id));
+                          })().map(field => (
+                            <option key={field.id} value={field.name}>
+                              {field.name}
+                            </option>
+                          ))}
+                        </select>
+                        <p className={`text-xs mt-1 ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>
+                          Håll Ctrl/Cmd för att välja flera (endast mappade målfält visas)
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-x-auto" style={{ minWidth: '1300px' }}>
         {/* Source Panel */}
-        <div className={`w-[450px] ${lightMode ? 'bg-gradient-to-b from-blue-50/40 to-white border-blue-100' : 'bg-[#1E293B] border-slate-700'} border-r flex flex-col transition-colors`}>
+        <div className={`flex-shrink-0 flex-grow basis-[450px] min-w-[400px] max-w-[550px] ${lightMode ? 'bg-gradient-to-b from-blue-50/40 to-white border-blue-100' : 'bg-gradient-to-b from-slate-950 to-slate-900 border-slate-700'} border-r flex flex-col transition-colors`}>
           <div className={`px-5 py-4 ${lightMode ? 'bg-gradient-to-r from-blue-50 to-blue-100/50 border-b border-blue-100' : 'bg-gradient-to-r from-blue-900/20 to-blue-800/20 border-slate-700'} border-b`}>
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <div className={`w-8 h-8 rounded-lg ${lightMode ? 'bg-blue-50' : 'bg-blue-500 bg-opacity-20'} flex items-center justify-center`}>
                   <Database className={`w-4 h-4 ${lightMode ? 'text-blue-600' : 'text-blue-400'}`} />
                 </div>
-                <h2 className={`font-semibold text-sm ${lightMode ? 'text-gray-900' : 'text-white'}`}>Source Schema</h2>
+                <h2 className={`font-semibold text-sm ${lightMode ? 'text-gray-900' : 'text-white'}`}>Källschema</h2>
               </div>
             </div>
-            <p className={`text-xs mb-3 ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>Drag elements to create mappings</p>
+            <p className={`text-xs mb-3 ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>Dra element för att skapa mappningar</p>
             {!sourceSchema ? (
               <label className={`cursor-pointer w-full px-3 py-2 rounded-lg text-xs font-medium transition flex items-center justify-center gap-2 ${lightMode ? 'bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200' : 'bg-blue-600 hover:bg-blue-500 text-white'}`}>
                 <Upload className="w-3.5 h-3.5" />
-                Upload Schema
+                Ladda schema
                 <input
                   type="file"
                   accept=".csv,.xsd,.xml"
@@ -1541,7 +1769,7 @@ const SchemaMapper = () => {
                         key={constant.id}
                         draggable={!processing}
                         onDragStart={(e) => handleDragStart(e, constant, 'constant')}
-                        className={`group relative ${lightMode ? 'bg-gradient-to-r from-purple-50 to-purple-100 hover:from-purple-100 hover:to-purple-200 border border-purple-200 hover:border-purple-300' : 'bg-gradient-to-r from-purple-900/40 to-purple-800/40 hover:from-purple-800/50 hover:to-purple-700/50 border border-purple-500 hover:border-purple-400'} p-3 rounded-lg mb-2 cursor-move transition-all`}
+                        className={`group relative ${lightMode ? 'bg-gradient-to-r from-purple-50 to-purple-100 hover:from-purple-100 hover:to-purple-200 border border-purple-200 hover:border-purple-300' : 'bg-gradient-to-r from-purple-500/40 to-purple-500/40 hover:from-purple-800/50 hover:to-purple-700/50 border border-purple-500 hover:border-purple-400'} p-3 rounded-lg mb-2 cursor-move transition-all`}
                       >
                         <div className="flex items-center justify-between mb-2">
                           <div className="flex-1 min-w-0">
@@ -1579,7 +1807,7 @@ const SchemaMapper = () => {
                             </button>
                           </div>
                         </div>
-                        <div className={`text-xs font-mono px-2 py-1 rounded break-all ${lightMode ? 'bg-purple-100 text-purple-800' : 'bg-purple-950/50 text-purple-200'}`}>
+                        <div className={`text-xs font-mono px-2 py-1.5 rounded break-all ${lightMode ? 'bg-purple-100 text-purple-800' : 'bg-purple-950/50 text-purple-200'}`}>
                           = "{constant.value}"
                         </div>
                       </div>
@@ -1616,11 +1844,11 @@ const SchemaMapper = () => {
         </div>
 
         {/* Mappings Panel */}
-        <div className={`flex-1 ${lightMode ? 'bg-gradient-to-b from-purple-50/20 to-gray-50' : 'bg-[#0F172A]'} flex flex-col transition-colors`}>
+        <div className={`flex-1 min-w-[500px] ${lightMode ? 'bg-gradient-to-b from-purple-50/20 to-gray-50' : 'bg-gradient-to-b from-slate-950 to-slate-900'} flex flex-col transition-colors`}>
           <div className={`px-6 py-4 ${lightMode ? 'bg-gradient-to-r from-purple-50/50 to-white border-purple-100/50 shadow-sm' : 'bg-[#1E293B] border-slate-700'} border-b transition-colors`}>
-            <h2 className={`font-semibold text-base mb-1 ${lightMode ? 'text-gray-900' : 'text-white'}`}>Mappings</h2>
+            <h2 className={`font-semibold text-base mb-1 ${lightMode ? 'text-gray-900' : 'text-white'}`}>Mappningar</h2>
             <p className={`text-xs ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>
-              Drag fields from left to right, or to existing mapping to merge
+              Dra fält från vänster till höger, eller till befintlig mappning för att slå ihop
             </p>
           </div>
           <div className="flex-1 overflow-y-auto p-6">
@@ -1636,8 +1864,6 @@ const SchemaMapper = () => {
               <div className="space-y-6">
                 {/* Regular mappings (non-container, non-child) */}
                 {mappings.filter(m => !m.is_container && !m.parent_repeat_container).map(mapping => {
-                  const currentTransforms = mapping.transforms || (mapping.transform && mapping.transform !== 'none' ? [mapping.transform] : []);
-
                   return (
                     <div
                       key={mapping.id}
@@ -1674,19 +1900,19 @@ const SchemaMapper = () => {
                             {mapping.source.map((srcId, idx) => (
                               <React.Fragment key={srcId}>
                                 {idx > 0 && <span className={`text-xs ${lightMode ? 'text-gray-400' : 'text-slate-500'}`}>+</span>}
-                                <div className={`px-3 py-1.5 rounded-lg text-sm font-medium truncate max-w-xs ${lightMode ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white' : 'bg-gradient-to-r from-blue-600 to-blue-500 text-white'}`} title={getSourceFieldName(srcId)}>
+                                <div className={`px-3 py-1.5 rounded-lg text-sm font-medium truncate max-w-xs ${lightMode ? 'bg-gradient-to-r from-blue-500 to-blue-400 text-white' : 'bg-gradient-to-r from-blue-700 to-blue-600 text-white'}`} title={getSourceFieldName(srcId)}>
                                   {getSourceFieldName(srcId)}
                                 </div>
                               </React.Fragment>
                             ))}
-                            <span className={`text-sm ${lightMode ? 'text-gray-400' : 'text-slate-400'}`}>→</span>
-                            <div className={`px-3 py-1.5 rounded-lg text-sm font-medium truncate max-w-xs ${lightMode ? 'bg-gradient-to-r from-green-500 to-green-600 text-white' : 'bg-gradient-to-r from-green-600 to-green-500 text-white'}`} title={getTargetFieldName(mapping.target)}>
+                            <ArrowRight className={`${lightMode ? 'text-gray-400' : 'text-slate-400'}`} size={24} />
+                            <div className={`px-3 py-1.5 rounded-lg text-sm font-medium truncate max-w-xs ${lightMode ? 'bg-gradient-to-r from-emerald-500 to-emerald-400 text-white' : 'bg-gradient-to-r from-emerald-700 to-emerald-600 text-white'}`} title={getTargetFieldName(mapping.target)}>
                               {getTargetFieldName(mapping.target)}
                             </div>
                           </div>
                           {mapping.source.length > 1 && (
-                            <div className={`text-xs px-2 py-1 rounded inline-block break-all ${lightMode ? 'bg-gray-100 text-gray-600' : 'bg-slate-900 text-slate-400'}`}>
-                              Result: "{getPreviewText(mapping)}"
+                            <div className={`text-xs px-2 py-1.5 rounded inline-block break-all ${lightMode ? 'bg-gray-100 text-gray-600' : 'bg-slate-900 text-slate-400'}`}>
+                              Resultat: "{getPreviewText(mapping)}"
                             </div>
                           )}
                         </div>
@@ -1697,11 +1923,40 @@ const SchemaMapper = () => {
                               setCurrentMappingForTransform(mapping.id);
                               setShowTransformModal(true);
                             }}
-                            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 disabled:opacity-50 ${lightMode ? 'bg-gradient-to-r from-purple-500 to-purple-400 hover:from-purple-600 hover:to-purple-500 text-white shadow-sm hover:shadow' : 'bg-gradient-to-r from-purple-800 to-slate-700 hover:from-purple-700 hover:to-slate-600 text-white'}`}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 disabled:opacity-50 ${lightMode ? 'bg-gradient-to-r from-purple-300 to-purple-200 hover:from-purple-700 hover:to-purple-600 text-black' : 'bg-gradient-to-r from-purple-800 to-purple-700 hover:from-purple-600 hover:to-purple-500 text-white'}`}
                             disabled={processing}
                           >
                             <Plus className="w-3.5 h-3.5" />
-                            Transform
+                            Transformera
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setCurrentMappingForCondition(mapping.id);
+                              setEditingConditions(mapping.conditions || []);
+                              setShowConditionModal(true);
+                            }}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 disabled:opacity-50 ${
+                              mapping.conditions && mapping.conditions.length > 0
+                                ? lightMode
+                                  ? 'bg-gradient-to-r from-amber-400 to-amber-300 hover:from-amber-600 hover:to-amber-500 text-black'
+                                  : 'bg-gradient-to-r from-amber-700 to-amber-600 hover:from-amber-500 hover:to-amber-400 text-white'
+                                : lightMode
+                                  ? 'bg-gradient-to-r from-amber-200 to-amber-100 hover:from-amber-400 hover:to-amber-300 text-black'
+                                  : 'bg-gradient-to-r from-amber-900 to-amber-800 hover:from-amber-700 hover:to-amber-600 text-white'
+                            }`}
+                            disabled={processing}
+                            title={mapping.conditions && mapping.conditions.length > 0 ? `${mapping.conditions.length} villkor aktiva` : 'Lägg till villkor'}
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+                            </svg>
+                            Villkor
+                            {mapping.conditions && mapping.conditions.length > 0 && (
+                              <span className={`px-1.5 py-0.5 rounded-full text-xs font-bold ${lightMode ? 'bg-amber-600 text-white' : 'bg-amber-400 text-black'}`}>
+                                {mapping.conditions.length}
+                              </span>
+                            )}
                           </button>
                           <button
                             onClick={(e) => {
@@ -1710,198 +1965,66 @@ const SchemaMapper = () => {
                             }}
                             className={`p-1.5 rounded hover:bg-red-500 hover:bg-opacity-10 transition flex-shrink-0 disabled:opacity-50 ${lightMode ? 'text-red-600' : 'text-red-400'}`}
                             disabled={processing}
-                            aria-label="Delete mapping"
+                            aria-label="Ta bort mappning"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
                         </div>
                       </div>
                       
-                      {currentTransforms.length > 0 && (
+                      {getTransformInstances(mapping).length > 0 && (
                         <div className="mb-3">
                           <div className="flex items-center gap-2 mb-2">
                             <Settings className={`w-3.5 h-3.5 ${lightMode ? 'text-purple-600' : 'text-purple-400'}`} />
-                            <span className={`text-xs font-semibold ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Active Transformations</span>
+                            <span className={`text-xs font-semibold ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Aktiva transformeringar</span>
                           </div>
                           <div className="flex flex-wrap gap-2">
-                            {currentTransforms.map(tId => {
-                              const transform = transforms.find(t => t.id === tId);
+                            {getTransformInstances(mapping).map(instance => {
+                              const transform = transforms.find(t => t.id === instance.type);
+                              const needsParams = ['replace', 'regex', 'format', 'default', 'concat'].includes(instance.type);
                               return transform ? (
-                                <button
-                                  key={tId}
-                                  onClick={() => handleTransformChange(mapping.id, tId)}
-                                  className={`px-3 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1 ${
-                                    lightMode ? 'bg-purple-100 text-purple-700 hover:bg-purple-200' : 'bg-purple-600 text-white hover:bg-purple-500'
-                                  }`}
-                                  disabled={processing}
+                                <div
+                                  key={instance.id}
+                                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${
+                                    lightMode ? 'bg-gradient-to-r from-purple-600 to-purple-400 text-white' : 'bg-gradient-to-r from-purple-600 to-purple-400 text-white'
+                                  } ${needsParams ? 'cursor-pointer hover:from-purple-700 hover:to-purple-500' : ''}`}
+                                  onClick={(e) => {
+                                    if (needsParams) {
+                                      e.stopPropagation();
+                                      setEditingTransform(instance.type);
+                                      setTransformParams(instance.params || {});
+                                      setEditingInstanceId(instance.id);
+                                      setCurrentMappingForTransform(mapping.id);
+                                      setShowTransformModal(true);
+                                    }
+                                  }}
+                                  title={needsParams ? 'Klicka för att redigera' : ''}
                                 >
                                   <span>{transform.icon}</span>
                                   <span>{transform.name}</span>
-                                  <span className="ml-1">×</span>
-                                </button>
+                                  {instance.params && Object.keys(instance.params).length > 0 && (
+                                    <span className={`text-[10px] opacity-75`}>
+                                      ({Object.values(instance.params).filter(v => v).slice(0, 1).join(', ').substring(0, 15)}{Object.values(instance.params).filter(v => v).join('').length > 15 ? '...' : ''})
+                                    </span>
+                                  )}
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      removeTransformInstance(mapping.id, instance.id);
+                                    }}
+                                    className="ml-1 hover:bg-white hover:bg-opacity-20 rounded px-1 transition"
+                                    disabled={processing}
+                                    title="Ta bort transformering"
+                                  >
+                                    ×
+                                  </button>
+                                </div>
                               ) : null;
                             })}
                           </div>
                         </div>
                       )}
 
-                      {/* Transform parameters */}
-                      {currentTransforms.includes('concat') && mapping.source.length > 1 && (
-                        <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'}`}>
-                          <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Separator:</label>
-                          <input
-                            type="text"
-                            value={mapping.params?.separator || ' '}
-                            onChange={(e) => {
-                              setMappings(prev => prev.map(m =>
-                                m.id === mapping.id
-                                  ? { ...m, params: { ...m.params, separator: e.target.value } }
-                                  : m
-                              ));
-                            }}
-                            className={`ml-2 px-2 py-1 rounded text-sm w-20 focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                            placeholder="' '"
-                            disabled={processing}
-                          />
-                        </div>
-                      )}
-
-                      {currentTransforms.includes('replace') && (
-                        <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'} space-y-2`}>
-                          <div>
-                            <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Från:</label>
-                            <input
-                              type="text"
-                              value={mapping.params?.from || ''}
-                              onChange={(e) => {
-                                setMappings(prev => prev.map(m =>
-                                  m.id === mapping.id
-                                    ? { ...m, params: { ...m.params, from: e.target.value } }
-                                    : m
-                                ));
-                              }}
-                              className={`ml-2 px-2 py-1 rounded text-sm w-full focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                              placeholder="Text att ersätta"
-                              disabled={processing}
-                            />
-                          </div>
-                          <div>
-                            <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Till:</label>
-                            <input
-                              type="text"
-                              value={mapping.params?.to || ''}
-                              onChange={(e) => {
-                                setMappings(prev => prev.map(m =>
-                                  m.id === mapping.id
-                                    ? { ...m, params: { ...m.params, to: e.target.value } }
-                                    : m
-                                ));
-                              }}
-                              className={`ml-2 px-2 py-1 rounded text-sm w-full focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                              placeholder="Ny text"
-                              disabled={processing}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      {currentTransforms.includes('regex') && (
-                        <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'} space-y-2`}>
-                          <div>
-                            <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Pattern (regex):</label>
-                            <input
-                              type="text"
-                              value={mapping.params?.pattern || ''}
-                              onChange={(e) => {
-                                setMappings(prev => prev.map(m =>
-                                  m.id === mapping.id
-                                    ? { ...m, params: { ...m.params, pattern: e.target.value } }
-                                    : m
-                                ));
-                              }}
-                              className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                              placeholder="t.ex. .*(\d{12}).*"
-                              disabled={processing}
-                            />
-                          </div>
-                          <div>
-                            <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Replacement:</label>
-                            <input
-                              type="text"
-                              value={mapping.params?.replacement || ''}
-                              onChange={(e) => {
-                                setMappings(prev => prev.map(m =>
-                                  m.id === mapping.id
-                                    ? { ...m, params: { ...m.params, replacement: e.target.value } }
-                                    : m
-                                ));
-                              }}
-                              className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                              placeholder="t.ex. $1"
-                              disabled={processing}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      {currentTransforms.includes('format') && (
-                        <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'} space-y-2`}>
-                          <div>
-                            <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Format-sträng:</label>
-                            <input
-                              type="text"
-                              value={mapping.params?.format || ''}
-                              onChange={(e) => {
-                                setMappings(prev => prev.map(m =>
-                                  m.id === mapping.id
-                                    ? { ...m, params: { ...m.params, format: e.target.value } }
-                                    : m
-                                ));
-                              }}
-                              className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                              placeholder="t.ex. {0}-{1}-{2}"
-                              disabled={processing}
-                            />
-                          </div>
-                          <div>
-                            <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Dela vid positioner:</label>
-                            <input
-                              type="text"
-                              value={mapping.params?.split_at || ''}
-                              onChange={(e) => {
-                                setMappings(prev => prev.map(m =>
-                                  m.id === mapping.id
-                                    ? { ...m, params: { ...m.params, split_at: e.target.value } }
-                                    : m
-                                ));
-                              }}
-                              className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                              placeholder="t.ex. 4,6,8"
-                              disabled={processing}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      {currentTransforms.includes('default') && (
-                        <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'}`}>
-                          <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Standardvärde:</label>
-                          <input
-                            type="text"
-                            value={mapping.params?.defaultValue || ''}
-                            onChange={(e) => {
-                              setMappings(prev => prev.map(m =>
-                                m.id === mapping.id
-                                  ? { ...m, params: { ...m.params, defaultValue: e.target.value } }
-                                  : m
-                              ));
-                            }}
-                            className={`ml-2 px-2 py-1 rounded text-sm w-full focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                            placeholder="Värde om källan är tom"
-                            disabled={processing}
-                          />
-                        </div>
-                      )}
 
                       {/* Aggregation mode */}
                       {mapping.source.length === 1 && (
@@ -1913,9 +2036,9 @@ const SchemaMapper = () => {
                                 <button
                                   key={mode.id}
                                   onClick={() => handleAggregationChange(mapping.id, mode.id)}
-                                  className={`px-3 py-1 rounded-lg text-xs transition ${
+                                  className={`px-3 py-1.5 rounded-lg text-xs transition ${
                                     (mapping.aggregation || 'foreach') === mode.id
-                                      ? lightMode ? 'bg-gradient-to-r from-orange-400 to-orange-500 text-white shadow-sm' : 'bg-orange-600 text-white'
+                                      ? 'bg-gradient-to-r from-orange-800 to-orange-700 text-white'
                                       : lightMode ? 'bg-gray-100 text-gray-700 hover:bg-gray-200' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
                                   }`}
                                   disabled={processing}
@@ -1939,7 +2062,7 @@ const SchemaMapper = () => {
                                       : m
                                   ));
                                 }}
-                                className="ml-2 bg-slate-700 px-2 py-1 rounded text-sm w-20 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                className="ml-2 bg-slate-700 px-2 py-1.5 rounded text-sm w-20 focus:outline-none focus:ring-2 focus:ring-purple-500"
                                 placeholder="', '"
                                 disabled={processing}
                               />
@@ -1965,21 +2088,16 @@ const SchemaMapper = () => {
                       className="bg-pink-900 bg-opacity-20 border-2 border-pink-500 rounded-lg p-4"
                     >
                       <div className="flex items-center justify-between mb-3">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-3">
                           <Repeat className="w-5 h-5 text-pink-400" />
-                          <div>
-                            <div className="font-medium text-pink-300 flex items-center gap-2">
-                              {sourceElemName} → {targetElemName}
-                              {isRepeatToSingle && (
-                                <span className="text-xs bg-pink-700 px-2 py-0.5 rounded">
-                                  Repeat-to-Single
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-xs text-pink-400 mt-1">
-                              {container.loop_element_path} → {container.target_wrapper_path || '(flera upprepade fält)'}
-                            </div>
-                          </div>
+                          <span className="font-medium text-pink-300">{sourceElemName}</span>
+                          <ArrowRight className="text-pink-400" size={24} />
+                          <span className="font-medium text-pink-300">{targetElemName}</span>
+                          {isRepeatToSingle && (
+                            <span className="text-xs bg-pink-700 px-2 py-0.5 rounded">
+                              Upprepa-till-Enskild
+                            </span>
+                          )}
                         </div>
                         <button
                           onClick={() => handleDeleteMapping(container.id)}
@@ -1990,17 +2108,56 @@ const SchemaMapper = () => {
                         </button>
                       </div>
 
+                      {/* Merge Separator - Only show if target is not repeatable */}
+                      {(() => {
+                        // Check if target is repeatable
+                        const targetField = targetSchema?.fields?.find(f => f.path === container.target_wrapper_path);
+                        const isTargetNonRepeatable = targetField && (targetField.maxOccurs === "1" || targetField.repeatable === false);
+
+                        if (isTargetNonRepeatable) {
+                          // Automatically set aggregation to 'merge' for non-repeatable targets
+                          if (container.aggregation !== 'merge') {
+                            setMappings(prev => prev.map(m =>
+                              m.id === container.id
+                                ? { ...m, aggregation: 'merge', params: { ...m.params, mergeSeparator: m.params?.mergeSeparator || ', ' } }
+                                : m
+                            ));
+                          }
+
+                          return (
+                            <div className={`text-xs ${lightMode ? 'text-pink-700' : 'text-pink-400'} flex items-center gap-3 mb-3`}>
+                              <span>Målfältet kan bara förekomma 1 gång - alla instanser kombineras.</span>
+                              <span className="whitespace-nowrap">Separator:</span>
+                              <input
+                                type="text"
+                                value={container.params?.mergeSeparator || ', '}
+                                onChange={(e) => {
+                                  setMappings(prev => prev.map(m =>
+                                    m.id === container.id
+                                      ? { ...m, params: { ...m.params, mergeSeparator: e.target.value } }
+                                      : m
+                                  ));
+                                }}
+                                className={`px-2 py-1 rounded text-xs w-20 ${lightMode ? 'bg-white border border-pink-300 text-gray-900' : 'bg-slate-800 border border-pink-600 text-white'}`}
+                                placeholder=", "
+                                disabled={processing}
+                              />
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
+
                       <div className="ml-4 space-y-3 pl-4">
                         {childMappings.map(mapping => {
-                          const currentTransforms = mapping.transforms || [];
                           const isSelected = selectedMapping === mapping.id;
-                          
+
                           return (
                             <div
                               key={mapping.id}
                               className={`${lightMode ? 'bg-gradient-to-br from-white to-gray-50/30 border-gray-100 hover:border-gray-200 shadow-sm hover:shadow-md' : 'bg-slate-800 border-slate-700 hover:border-slate-600'} rounded-xl p-4 border transition-all cursor-pointer ${
                                 isSelected
-                                  ? lightMode ? 'border-purple-300 shadow-lg ring-1 ring-purple-100' : 'border-purple-500 shadow-xl'
+                                  ? lightMode ? 'border-purple-300 shadow-lg ring-1 ring-purple-100' : 'border-slate-400 shadow-xl'
                                   : ''
                               }`}
                               onClick={() => setSelectedMapping(mapping.id)}
@@ -2013,16 +2170,16 @@ const SchemaMapper = () => {
                                     return (
                                       <div
                                         key={srcId}
-                                        className={`px-2 py-1 rounded text-xs ${
-                                          constant ? 'bg-purple-600' : 'bg-blue-600'
+                                        className={`px-2 py-1.5 rounded text-xs text-white ${
+                                          constant ? 'bg-gradient-to-r from-purple-800 to-purple-700' : 'bg-gradient-to-r from-blue-600 to-blue-500'
                                         }`}
                                       >
                                         {constant ? constant.name : getSourceFieldName(srcId)}
                                       </div>
                                     );
                                   })}
-                                  <span className="text-slate-400 text-xs">→</span>
-                                  <div className="bg-green-600 px-2 py-1 rounded text-xs">
+                                  <ArrowRight className="text-slate-400" size={24} />
+                                  <div className="bg-gradient-to-r from-emerald-600 to-emerald-500 px-2 py-1.5 rounded text-xs text-white">
                                     {getTargetFieldName(mapping.target)}
                                   </div>
                                 </div>
@@ -2033,11 +2190,11 @@ const SchemaMapper = () => {
                                       setCurrentMappingForTransform(mapping.id);
                                       setShowTransformModal(true);
                                     }}
-                                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 disabled:opacity-50 ${lightMode ? 'bg-gradient-to-r from-purple-500 to-purple-400 hover:from-purple-600 hover:to-purple-500 text-white shadow-sm hover:shadow' : 'bg-gradient-to-r from-purple-800 to-slate-700 hover:from-purple-700 hover:to-slate-600 text-white'}`}
+                                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 disabled:opacity-50 ${lightMode ? 'bg-gradient-to-r from-purple-300 to-purple-200 hover:from-purple-700 hover:to-purple-600 text-black' : 'bg-gradient-to-r from-purple-800 to-purple-700 hover:from-purple-600 hover:to-purple-500 text-white'}`}
                                     disabled={processing}
                                   >
                                     <Plus className="w-3.5 h-3.5" />
-                                    Transform
+                                    Transformera
                                   </button>
                                   <button
                                     onClick={(e) => {
@@ -2046,201 +2203,66 @@ const SchemaMapper = () => {
                                     }}
                                     className={`p-1.5 rounded hover:bg-red-500 hover:bg-opacity-10 transition flex-shrink-0 disabled:opacity-50 ${lightMode ? 'text-red-600' : 'text-red-400'}`}
                                     disabled={processing}
-                                    aria-label="Delete mapping"
+                                    aria-label="Ta bort mappning"
                                   >
                                     <Trash2 className="w-4 h-4" />
                                   </button>
                                 </div>
                               </div>
 
-                              {currentTransforms.length > 0 && (
+                              {getTransformInstances(mapping).length > 0 && (
                                 <div className="mb-3">
                                   <div className="flex items-center gap-2 mb-2">
                                     <Settings className={`w-3.5 h-3.5 ${lightMode ? 'text-purple-600' : 'text-purple-400'}`} />
-                                    <span className={`text-xs font-semibold ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Active Transformations</span>
+                                    <span className={`text-xs font-semibold ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Aktiva transformeringar</span>
                                   </div>
                                   <div className="flex flex-wrap gap-2">
-                                    {currentTransforms.map(tId => {
-                                      const transform = transforms.find(t => t.id === tId);
+                                    {getTransformInstances(mapping).map(instance => {
+                                      const transform = transforms.find(t => t.id === instance.type);
+                                      const needsParams = ['replace', 'regex', 'format', 'default', 'concat'].includes(instance.type);
                                       return transform ? (
-                                        <button
-                                          key={tId}
+                                        <div
+                                          key={instance.id}
+                                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${
+                                            lightMode ? 'bg-gradient-to-r from-purple-600 to-purple-400 text-white' : 'bg-gradient-to-r from-purple-600 to-purple-400 text-white'
+                                          } ${needsParams ? 'cursor-pointer hover:from-purple-700 hover:to-purple-500' : ''}`}
                                           onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleTransformChange(mapping.id, tId);
+                                            if (needsParams) {
+                                              e.stopPropagation();
+                                              setEditingTransform(instance.type);
+                                              setTransformParams(instance.params || {});
+                                              setEditingInstanceId(instance.id);
+                                              setCurrentMappingForTransform(mapping.id);
+                                              setShowTransformModal(true);
+                                            }
                                           }}
-                                          className={`px-3 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1 ${
-                                            lightMode ? 'bg-purple-100 text-purple-700 hover:bg-purple-200' : 'bg-purple-600 text-white hover:bg-purple-500'
-                                          }`}
-                                          disabled={processing}
+                                          title={needsParams ? 'Klicka för att redigera' : ''}
                                         >
                                           <span>{transform.icon}</span>
                                           <span>{transform.name}</span>
-                                          <span className="ml-1">×</span>
-                                        </button>
+                                          {instance.params && Object.keys(instance.params).length > 0 && (
+                                            <span className={`text-[10px] opacity-75`}>
+                                              ({Object.values(instance.params).filter(v => v).slice(0, 1).join(', ').substring(0, 15)}{Object.values(instance.params).filter(v => v).join('').length > 15 ? '...' : ''})
+                                            </span>
+                                          )}
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              removeTransformInstance(mapping.id, instance.id);
+                                            }}
+                                            className="ml-1 hover:bg-white hover:bg-opacity-20 rounded px-1 transition"
+                                            disabled={processing}
+                                            title="Ta bort transformering"
+                                          >
+                                            ×
+                                          </button>
+                                        </div>
                                       ) : null;
                                     })}
                                   </div>
                                 </div>
                               )}
 
-                              {/* Transform parameters */}
-                              {currentTransforms.includes('concat') && mapping.source.length > 1 && (
-                                <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'}`}>
-                                  <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Separator:</label>
-                                  <input
-                                    type="text"
-                                    value={mapping.params?.separator || ' '}
-                                    onChange={(e) => {
-                                      setMappings(prev => prev.map(m =>
-                                        m.id === mapping.id
-                                          ? { ...m, params: { ...m.params, separator: e.target.value } }
-                                          : m
-                                      ));
-                                    }}
-                                    className={`ml-2 px-2 py-1 rounded text-sm w-20 focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                    placeholder="' '"
-                                    disabled={processing}
-                                  />
-                                </div>
-                              )}
-
-                              {currentTransforms.includes('replace') && (
-                                <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'} space-y-2`}>
-                                  <div>
-                                    <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Från:</label>
-                                    <input
-                                      type="text"
-                                      value={mapping.params?.from_ || ''}
-                                      onChange={(e) => {
-                                        setMappings(prev => prev.map(m =>
-                                          m.id === mapping.id
-                                            ? { ...m, params: { ...m.params, from_: e.target.value } }
-                                            : m
-                                        ));
-                                      }}
-                                      className={`ml-2 px-2 py-1 rounded text-sm w-full focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                      placeholder="Text att ersätta"
-                                      disabled={processing}
-                                    />
-                                  </div>
-                                  <div>
-                                    <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Till:</label>
-                                    <input
-                                      type="text"
-                                      value={mapping.params?.to || ''}
-                                      onChange={(e) => {
-                                        setMappings(prev => prev.map(m =>
-                                          m.id === mapping.id
-                                            ? { ...m, params: { ...m.params, to: e.target.value } }
-                                            : m
-                                        ));
-                                      }}
-                                      className={`ml-2 px-2 py-1 rounded text-sm w-full focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                      placeholder="Ny text"
-                                      disabled={processing}
-                                    />
-                                  </div>
-                                </div>
-                              )}
-
-                              {currentTransforms.includes('regex') && (
-                                <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'} space-y-2`}>
-                                  <div>
-                                    <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Pattern (regex):</label>
-                                    <input
-                                      type="text"
-                                      value={mapping.params?.pattern || ''}
-                                      onChange={(e) => {
-                                        setMappings(prev => prev.map(m =>
-                                          m.id === mapping.id
-                                            ? { ...m, params: { ...m.params, pattern: e.target.value } }
-                                            : m
-                                        ));
-                                      }}
-                                      className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                      placeholder="t.ex. .*(\d{12}).*"
-                                      disabled={processing}
-                                    />
-                                  </div>
-                                  <div>
-                                    <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Replacement:</label>
-                                    <input
-                                      type="text"
-                                      value={mapping.params?.replacement || ''}
-                                      onChange={(e) => {
-                                        setMappings(prev => prev.map(m =>
-                                          m.id === mapping.id
-                                            ? { ...m, params: { ...m.params, replacement: e.target.value } }
-                                            : m
-                                        ));
-                                      }}
-                                      className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                      placeholder="t.ex. $1"
-                                      disabled={processing}
-                                    />
-                                  </div>
-                                </div>
-                              )}
-
-                              {currentTransforms.includes('format') && (
-                                <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'} space-y-2`}>
-                                  <div>
-                                    <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Format-sträng:</label>
-                                    <input
-                                      type="text"
-                                      value={mapping.params?.format || ''}
-                                      onChange={(e) => {
-                                        setMappings(prev => prev.map(m =>
-                                          m.id === mapping.id
-                                            ? { ...m, params: { ...m.params, format: e.target.value } }
-                                            : m
-                                        ));
-                                      }}
-                                      className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                      placeholder="t.ex. {0}-{1}-{2}"
-                                      disabled={processing}
-                                    />
-                                  </div>
-                                  <div>
-                                    <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Dela vid positioner:</label>
-                                    <input
-                                      type="text"
-                                      value={mapping.params?.split_at || ''}
-                                      onChange={(e) => {
-                                        setMappings(prev => prev.map(m =>
-                                          m.id === mapping.id
-                                            ? { ...m, params: { ...m.params, split_at: e.target.value } }
-                                            : m
-                                        ));
-                                      }}
-                                      className={`ml-2 px-2 py-1 rounded text-sm w-full font-mono focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                      placeholder="t.ex. 4,6,8"
-                                      disabled={processing}
-                                    />
-                                  </div>
-                                </div>
-                              )}
-
-                              {currentTransforms.includes('default') && (
-                                <div className={`pt-3 border-t ${lightMode ? 'border-gray-200' : 'border-slate-700'}`}>
-                                  <label className={`text-xs ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Standardvärde:</label>
-                                  <input
-                                    type="text"
-                                    value={mapping.params?.defaultValue || ''}
-                                    onChange={(e) => {
-                                      setMappings(prev => prev.map(m =>
-                                        m.id === mapping.id
-                                          ? { ...m, params: { ...m.params, defaultValue: e.target.value } }
-                                          : m
-                                      ));
-                                    }}
-                                    className={`ml-2 px-2 py-1 rounded text-sm w-full focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-gray-100 text-gray-900 border border-gray-300' : 'bg-slate-700 text-white'}`}
-                                    placeholder="Värde om källan är tom"
-                                    disabled={processing}
-                                  />
-                                </div>
-                              )}
                             </div>
                           );
                         })}
@@ -2259,21 +2281,21 @@ const SchemaMapper = () => {
         </div>
 
         {/* Target Panel */}
-        <div className={`w-[450px] ${lightMode ? 'bg-gradient-to-b from-emerald-50/40 to-white border-emerald-100' : 'bg-[#1E293B] border-slate-700'} border-l flex flex-col transition-colors`}>
+        <div className={`flex-shrink-0 flex-grow basis-[450px] min-w-[400px] max-w-[550px] ${lightMode ? 'bg-gradient-to-b from-emerald-50/40 to-white border-emerald-100' : 'bg-gradient-to-b from-slate-950 to-slate-900 border-slate-700'} border-l flex flex-col transition-colors`}>
           <div className={`px-5 py-4 ${lightMode ? 'bg-gradient-to-r from-emerald-50 to-emerald-100/50 border-b border-emerald-100' : 'bg-gradient-to-r from-green-900/20 to-green-800/20 border-slate-700'} border-b`}>
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <div className={`w-8 h-8 rounded-lg ${lightMode ? 'bg-green-50' : 'bg-green-500 bg-opacity-20'} flex items-center justify-center`}>
                   <Database className={`w-4 h-4 ${lightMode ? 'text-green-600' : 'text-green-400'}`} />
                 </div>
-                <h2 className={`font-semibold text-sm ${lightMode ? 'text-gray-900' : 'text-white'}`}>Target Schema</h2>
+                <h2 className={`font-semibold text-sm ${lightMode ? 'text-gray-900' : 'text-white'}`}>Målschema</h2>
               </div>
             </div>
-            <p className={`text-xs mb-3 ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>Drop here to map elements</p>
+            <p className={`text-xs mb-3 ${lightMode ? 'text-gray-500' : 'text-slate-400'}`}>Släpp här för att mappa element</p>
             {!targetSchema ? (
               <label className={`cursor-pointer w-full px-3 py-2 rounded-lg text-xs font-medium transition flex items-center justify-center gap-2 ${processing || isLoading ? 'opacity-50 cursor-not-allowed' : ''} ${lightMode ? 'bg-green-50 hover:bg-green-100 text-green-700 border border-green-200' : 'bg-green-600 hover:bg-green-500 text-white'}`}>
                 <Upload className="w-3.5 h-3.5" />
-                Upload Schema
+                Ladda schema
                 <input
                   type="file"
                   accept=".xsd,.xml"
@@ -2320,122 +2342,8 @@ const SchemaMapper = () => {
                   return tree.map(node => renderTargetTreeNode(node, 0, 'target'));
                 })()}
 
-                {/* OLD REPEATING ELEMENTS - TO BE DELETED */}
-                {false && targetSchema.repeating_elements && targetSchema.repeating_elements.length > 0 && (
-                  <div className="mb-4">
-                    <div className="text-xs font-semibold text-pink-400 mb-2 flex items-center gap-2">
-                      <Repeat className="w-4 h-4" />
-                      Upprepande element ({targetSchema.repeating_elements.length})
-                    </div>
-                    {targetSchema.repeating_elements.map((repElem, idx) => {
-                      const isExpanded = expandedNodes[`target-${repElem.path}`];
-                      const container = mappings.find(m => 
-                        m.is_container && m.target_wrapper_path === repElem.wrapper_path
-                      );
-                      
-                      return (
-                        <div key={`target-rep-${idx}`} className="mb-2">
-                          <div
-                            onDragOver={!processing ? handleDragOver : undefined}
-                            onDrop={!processing ? (e) => {
-                              e.preventDefault();
-                              if (draggedField && draggedField.repeatingElement) {
-                                const sourceRep = draggedField.repeatingElement;
-                                const newContainer = {
-                                  id: `container-${Date.now()}`,
-                                  source: [],
-                                  target: repElem.id || `tgt-rep-${idx}`,
-                                  aggregation: 'repeat',
-                                  loop_element_path: sourceRep.path,
-                                  target_wrapper_path: repElem.wrapper_path || repElem.path,
-                                  is_container: true,
-                                  transforms: [],
-                                  params: {}
-                                };
-                                setMappings(prev => [...prev, newContainer]);
-                              }
-                            } : undefined}
-                            className={`bg-slate-700 hover:bg-slate-600 p-3 rounded transition cursor-pointer ${
-                              container ? 'border-l-4 border-pink-500' : ''
-                            }`}
-                          >
-                            <div className="flex items-center mb-2">
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setExpandedNodes(prev => ({
-                                    ...prev,
-                                    [`target-${repElem.path}`]: !prev[`target-${repElem.path}`]
-                                  }));
-                                }}
-                                className="text-pink-400 hover:text-pink-300 transition mr-2 flex-shrink-0"
-                                title="Visa/dölj barn-element"
-                              >
-                                {isExpanded ? '▼' : '▶'}
-                              </button>
-                              <Repeat className="w-4 h-4 text-pink-400 flex-shrink-0 mr-2" title="Upprepande element" />
-                              <div className="flex-1 min-w-0">
-                                <div className="font-medium text-sm text-green-300 mb-1 truncate flex items-center gap-2" title={repElem.name}>
-                                  {repElem.name}
-                                  <span className="text-xs bg-pink-600 px-2 py-0.5 rounded">{repElem.maxOccurs || repElem.count || 'unbounded'}</span>
-                                </div>
-                                <div className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-1 rounded inline-block break-all">
-                                  {repElem.path}
-                                </div>
-                              </div>
-                            </div>
-                            {container && (
-                              <div className="text-xs text-pink-400 flex items-center gap-1 ml-10">
-                                <span>✓</span> Mappad från {container.loop_element_path?.split('/').pop()}
-                              </div>
-                            )}
-                          </div>
-                          
-                          {/* Child Fields */}
-                          {isExpanded && repElem.fields && repElem.fields.length > 0 && (
-                            <div className="ml-6 mt-2 space-y-1 pl-3">
-                              {repElem.fields.map((childField, cidx) => {
-                                const childFieldObj = {
-                                  id: childField.id || `tgt-child-${idx}-${cidx}`,
-                                  name: childField.name,
-                                  path: childField.path,
-                                  type: childField.type || 'string',
-                                  parentRepeating: repElem.path
-                                };
-                                const fieldMappings = getMappingsForTarget(childFieldObj.id);
-                                
-                                return (
-                                  <div
-                                    key={cidx}
-                                    onDragOver={!processing ? handleDragOver : undefined}
-                                    onDrop={!processing ? (e) => handleDrop(e, childFieldObj) : undefined}
-                                    className={`bg-slate-700 hover:bg-slate-600 p-2 rounded text-xs transition cursor-pointer ${
-                                      fieldMappings.length > 0 ? 'border-l-2 border-green-500' : ''
-                                    }`}
-                                  >
-                                    <div className="flex items-center justify-between">
-                                      <div className="flex-1 min-w-0">
-                                        <div className="text-green-200 truncate">{childFieldObj.name}</div>
-                                        <div className="text-slate-500 font-mono truncate">{childField.relative_path || childField.path}</div>
-                                      </div>
-                                      <span className="text-slate-500 ml-2">{childFieldObj.type}</span>
-                                    </div>
-                                    {fieldMappings.length > 0 && (
-                                      <div className="text-green-400 mt-1">✓ Mappad</div>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-                
-                {/* Regular Fields */}
-                {targetSchema.fields.map(field => {
+                {/* Regular Fields - REMOVED: Causes duplicates since tree already shows all fields */}
+                {false && targetSchema.fields.map(field => {
                 const fieldMappings = getMappingsForTarget(field.id);
                 const isHovered = hoveredTarget === field.id;
                 const fullPath = field.path || field.name;
@@ -2471,7 +2379,7 @@ const SchemaMapper = () => {
                     onDrop={!processing ? (e) => handleDrop(e, field) : undefined}
                     onDragEnter={() => !processing && setHoveredTarget(field.id)}
                     onDragLeave={() => setHoveredTarget(null)}
-                    className={`group relative ${lightMode ? 'bg-gray-50 hover:bg-green-50 border border-gray-200 hover:border-green-300' : 'bg-slate-700 hover:bg-slate-600 border border-slate-600 hover:border-green-500'} p-3 rounded-lg transition-all ${
+                    className={`group relative ${lightMode ? 'bg-gray-50 hover:bg-green-50 border border-gray-200 hover:border-green-300' : 'bg-slate-800 hover:bg-slate-700 border border-slate-600 hover:border-green-500'} p-3 rounded-lg transition-all ${
                       isHovered && !processing ? lightMode ? 'ring-2 ring-green-400 bg-green-50' : 'ring-2 ring-green-400 bg-slate-600' : ''
                     } ${
                       fieldMappings.length > 0 ? 'border-l-4 border-l-green-500' : ''
@@ -2488,7 +2396,7 @@ const SchemaMapper = () => {
                           {field.name}
                           {isRepeatable && (
                             <span className="text-xs bg-pink-500 bg-opacity-20 text-pink-400 px-2 py-0.5 rounded" title={`maxOccurs: ${field.maxOccurs || 'unbounded'}`}>
-                              Repeatable
+                              Upprepande
                             </span>
                           )}
                         </div>
@@ -2530,6 +2438,9 @@ const SchemaMapper = () => {
           onClick={() => {
             setShowTransformModal(false);
             setCurrentMappingForTransform(null);
+            setEditingTransform(null);
+            setTransformParams({});
+            setEditingInstanceId(null);
           }}
         >
           <div
@@ -2537,85 +2448,432 @@ const SchemaMapper = () => {
             onClick={(e) => e.stopPropagation()}
           >
             <div className={`px-6 py-4 ${lightMode ? 'border-gray-200' : 'border-slate-700'} border-b flex items-center justify-between`}>
-              <h3 className={`text-lg font-semibold ${lightMode ? 'text-gray-900' : 'text-white'}`}>Add Transformation</h3>
+              <h3 className={`text-lg font-semibold ${lightMode ? 'text-gray-900' : 'text-white'}`}>
+                {editingTransform ? `Konfigurera ${transforms.find(t => t.id === editingTransform)?.name}` : 'Lägg till transformering'}
+              </h3>
               <button
                 onClick={() => {
                   setShowTransformModal(false);
                   setCurrentMappingForTransform(null);
+                  setEditingTransform(null);
+                  setTransformParams({});
+                  setEditingInstanceId(null);
                 }}
                 className={`${lightMode ? 'text-gray-400 hover:text-gray-600' : 'text-slate-400 hover:text-white'} transition`}
               >
                 ✕
               </button>
             </div>
-            <div className="p-6 overflow-y-auto">
-              <p className={`text-sm mb-6 ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Select a transformation to apply to the mapped data</p>
-              <div className="grid grid-cols-2 gap-4">
-                {transforms.filter(t => t.id !== 'none').map(transform => {
-                  const mapping = mappings.find(m => m.id === currentMappingForTransform);
-                  const isActive = mapping && (mapping.transforms || []).includes(transform.id);
 
-                  const gradientColors = {
-                    'trim': lightMode ? 'bg-gradient-to-br from-blue-400 to-blue-600' : 'bg-gradient-to-br from-blue-500 to-blue-700',
-                    'uppercase': lightMode ? 'bg-gradient-to-br from-green-400 to-green-600' : 'bg-gradient-to-br from-green-500 to-green-700',
-                    'lowercase': lightMode ? 'bg-gradient-to-br from-pink-400 to-pink-600' : 'bg-gradient-to-br from-pink-500 to-pink-700',
-                    'regex': lightMode ? 'bg-gradient-to-br from-orange-400 to-orange-600' : 'bg-gradient-to-br from-orange-500 to-orange-700',
-                    'replace': lightMode ? 'bg-gradient-to-br from-rose-400 to-rose-600' : 'bg-gradient-to-br from-rose-500 to-rose-700',
-                    'format': lightMode ? 'bg-gradient-to-br from-purple-400 to-purple-600' : 'bg-gradient-to-br from-purple-500 to-purple-700',
-                    'concat': lightMode ? 'bg-gradient-to-br from-indigo-400 to-indigo-600' : 'bg-gradient-to-br from-indigo-500 to-indigo-700',
-                    'default': lightMode ? 'bg-gradient-to-br from-amber-400 to-amber-600' : 'bg-gradient-to-br from-amber-500 to-amber-700'
-                  };
+            {!editingTransform ? (
+              <div className="p-6 overflow-y-auto">
+                <p className={`text-sm mb-6 ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>Välj en transformering att tillämpa på mappade data</p>
+                <div className="grid grid-cols-2 gap-4">
+                  {transforms.filter(t => t.id !== 'none').map(transform => {
+                    const gradientColors = {
+                      'trim': lightMode ? 'bg-gradient-to-br from-blue-400 to-blue-600' : 'bg-gradient-to-br from-blue-500 to-blue-700',
+                      'uppercase': lightMode ? 'bg-gradient-to-br from-green-400 to-green-600' : 'bg-gradient-to-br from-green-500 to-green-700',
+                      'lowercase': lightMode ? 'bg-gradient-to-br from-pink-400 to-pink-600' : 'bg-gradient-to-br from-pink-500 to-pink-700',
+                      'regex': lightMode ? 'bg-gradient-to-br from-orange-400 to-orange-600' : 'bg-gradient-to-br from-orange-500 to-orange-700',
+                      'replace': lightMode ? 'bg-gradient-to-br from-rose-400 to-rose-600' : 'bg-gradient-to-br from-rose-500 to-rose-700',
+                      'format': lightMode ? 'bg-gradient-to-br from-purple-400 to-purple-600' : 'bg-gradient-to-br from-purple-500 to-purple-700',
+                      'concat': lightMode ? 'bg-gradient-to-br from-indigo-400 to-indigo-600' : 'bg-gradient-to-br from-indigo-500 to-indigo-700',
+                      'default': lightMode ? 'bg-gradient-to-br from-amber-400 to-amber-600' : 'bg-gradient-to-br from-amber-500 to-amber-700'
+                    };
 
-                  return (
-                    <button
-                      key={transform.id}
-                      onClick={() => {
-                        handleTransformChange(currentMappingForTransform, transform.id);
-                        // Close modal after short delay so user can see the selection
-                        setTimeout(() => {
-                          setShowTransformModal(false);
-                          setCurrentMappingForTransform(null);
-                        }, 150);
-                      }}
-                      className={`p-5 rounded-2xl border-2 text-left transition-all ${
-                        isActive
-                          ? lightMode
-                            ? 'border-blue-400 bg-blue-50 shadow-lg scale-[1.02]'
-                            : 'border-blue-500 bg-blue-900 bg-opacity-20 shadow-lg scale-[1.02]'
-                          : lightMode
+                    const needsParams = ['replace', 'regex', 'format', 'default', 'concat'].includes(transform.id);
+
+                    return (
+                      <button
+                        key={transform.id}
+                        onClick={() => {
+                          if (needsParams) {
+                            setEditingTransform(transform.id);
+                            setTransformParams({});
+                          } else {
+                            saveTransformInstance(currentMappingForTransform, transform.id);
+                            setTimeout(() => {
+                              setShowTransformModal(false);
+                              setCurrentMappingForTransform(null);
+                            }, 150);
+                          }
+                        }}
+                        className={`p-5 rounded-2xl border-2 text-left transition-all ${
+                          lightMode
                             ? 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-md'
                             : 'border-slate-700 bg-slate-800 bg-opacity-50 hover:border-slate-600 hover:shadow-lg'
+                        }`}
+                      >
+                        <div className="flex items-start gap-3 mb-3">
+                          <div className={`w-12 h-12 rounded-xl flex items-center justify-center text-white text-xl font-bold shadow-md ${gradientColors[transform.id] || (lightMode ? 'bg-gradient-to-br from-gray-400 to-gray-600' : 'bg-gradient-to-br from-slate-500 to-slate-700')}`}>
+                            {transform.icon}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className={`font-semibold text-base mb-1 ${lightMode ? 'text-gray-900' : 'text-white'}`}>
+                              {transform.name}
+                            </div>
+                          </div>
+                        </div>
+                        <p className={`text-xs leading-relaxed ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>
+                          {transform.id === 'uppercase' && 'Konvertera text till versaler'}
+                          {transform.id === 'lowercase' && 'Konvertera text till gemener'}
+                          {transform.id === 'trim' && 'Ta bort mellanslag före och efter'}
+                          {transform.id === 'concat' && 'Slå ihop flera värden'}
+                          {transform.id === 'replace' && 'Ersätt specifik text'}
+                          {transform.id === 'regex' && 'Använd reguljära uttryck för transformering'}
+                          {transform.id === 'format' && 'Formatera text med anpassat mönster'}
+                          {transform.id === 'default' && 'Sätt standardvärde om tomt'}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="p-6 overflow-y-auto">
+                <div className="space-y-4">
+                  {editingTransform === 'replace' && (
+                    <>
+                      <div>
+                        <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Från (text att ersätta):</label>
+                        <input
+                          type="text"
+                          value={transformParams.from_ || ''}
+                          onChange={(e) => setTransformParams(prev => ({ ...prev, from_: e.target.value }))}
+                          className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                          placeholder="Text att ersätta"
+                        />
+                      </div>
+                      <div>
+                        <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Till (ny text):</label>
+                        <input
+                          type="text"
+                          value={transformParams.to || ''}
+                          onChange={(e) => setTransformParams(prev => ({ ...prev, to: e.target.value }))}
+                          className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                          placeholder="Ny text"
+                        />
+                      </div>
+                    </>
+                  )}
+
+                  {editingTransform === 'regex' && (
+                    <>
+                      <div>
+                        <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Mönster (regex):</label>
+                        <input
+                          type="text"
+                          value={transformParams.pattern || ''}
+                          onChange={(e) => setTransformParams(prev => ({ ...prev, pattern: e.target.value }))}
+                          className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                          placeholder="t.ex. [0-9]+"
+                        />
+                      </div>
+                      <div>
+                        <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Ersättning:</label>
+                        <input
+                          type="text"
+                          value={transformParams.replacement || ''}
+                          onChange={(e) => setTransformParams(prev => ({ ...prev, replacement: e.target.value }))}
+                          className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                          placeholder="Ersättningstext"
+                        />
+                      </div>
+                    </>
+                  )}
+
+                  {editingTransform === 'format' && (
+                    <div>
+                      <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Format:</label>
+                      <input
+                        type="text"
+                        value={transformParams.format || ''}
+                        onChange={(e) => setTransformParams(prev => ({ ...prev, format: e.target.value }))}
+                        className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                        placeholder="t.ex. {value} kr"
+                      />
+                    </div>
+                  )}
+
+                  {editingTransform === 'default' && (
+                    <div>
+                      <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Standardvärde:</label>
+                      <input
+                        type="text"
+                        value={transformParams.defaultValue || ''}
+                        onChange={(e) => setTransformParams(prev => ({ ...prev, defaultValue: e.target.value }))}
+                        className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                        placeholder="Värde om fältet är tomt"
+                      />
+                    </div>
+                  )}
+
+                  {editingTransform === 'concat' && (
+                    <div>
+                      <label className={`text-sm font-medium block mb-2 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>Separator:</label>
+                      <input
+                        type="text"
+                        value={transformParams.separator || ' '}
+                        onChange={(e) => setTransformParams(prev => ({ ...prev, separator: e.target.value }))}
+                        className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-purple-500 ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-700 border-slate-600 text-white'}`}
+                        placeholder="Mellanslag"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex gap-3 mt-6">
+                  <button
+                    onClick={() => {
+                      setEditingTransform(null);
+                      setTransformParams({});
+                      setEditingInstanceId(null);
+                    }}
+                    className={`flex-1 px-4 py-2 rounded-lg text-sm font-medium transition ${
+                      lightMode
+                        ? 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                        : 'bg-slate-700 hover:bg-slate-600 text-white'
+                    }`}
+                  >
+                    Tillbaka
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (editingInstanceId) {
+                        updateTransformInstance(currentMappingForTransform, editingInstanceId, transformParams);
+                      } else {
+                        saveTransformInstance(currentMappingForTransform, editingTransform, transformParams);
+                      }
+                      setShowTransformModal(false);
+                      setCurrentMappingForTransform(null);
+                      setEditingTransform(null);
+                      setTransformParams({});
+                      setEditingInstanceId(null);
+                    }}
+                    className="flex-1 px-4 py-2 rounded-lg text-sm font-medium bg-gradient-to-r from-purple-600 to-purple-400 hover:from-purple-700 hover:to-purple-500 text-white transition"
+                  >
+                    Spara
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Condition Editor Modal */}
+      {showConditionModal && currentMappingForCondition && (
+        <div
+          className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
+          onClick={() => {
+            setShowConditionModal(false);
+            setCurrentMappingForCondition(null);
+            setEditingConditions([]);
+          }}
+        >
+          <div
+            className={`${lightMode ? 'bg-white' : 'bg-slate-800'} rounded-xl w-[650px] max-h-[85vh] flex flex-col shadow-2xl`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className={`px-6 py-4 ${lightMode ? 'border-gray-200' : 'border-slate-700'} border-b flex items-center justify-between`}>
+              <h3 className={`text-lg font-semibold ${lightMode ? 'text-gray-900' : 'text-white'}`}>
+                Villkor för mappning
+              </h3>
+              <button
+                onClick={() => {
+                  setShowConditionModal(false);
+                  setCurrentMappingForCondition(null);
+                  setEditingConditions([]);
+                }}
+                className={`${lightMode ? 'text-gray-400 hover:text-gray-600' : 'text-slate-400 hover:text-white'} transition`}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto flex-1">
+              <p className={`text-sm mb-4 ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>
+                Lägg till villkor för att filtrera vilka källelement som ska mappas. Alla villkor måste vara uppfyllda (AND-logik).
+              </p>
+
+              {editingConditions.length === 0 ? (
+                <div className={`text-center py-8 ${lightMode ? 'text-gray-400' : 'text-slate-500'}`}>
+                  <p>Inga villkor tillagda ännu</p>
+                  <p className="text-xs mt-2">Klicka på "Lägg till villkor" nedan</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {editingConditions.map((condition, index) => (
+                    <div
+                      key={index}
+                      className={`p-4 rounded-lg border ${
+                        lightMode
+                          ? 'bg-amber-50 border-amber-200'
+                          : 'bg-amber-900 bg-opacity-20 border-amber-700'
                       }`}
                     >
-                      <div className="flex items-start gap-3 mb-3">
-                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center text-white text-xl font-bold shadow-md ${gradientColors[transform.id] || (lightMode ? 'bg-gradient-to-br from-gray-400 to-gray-600' : 'bg-gradient-to-br from-slate-500 to-slate-700')}`}>
-                          {transform.icon}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className={`font-semibold text-base mb-1 ${lightMode ? 'text-gray-900' : 'text-white'}`}>
-                            {transform.name}
+                      <div className="flex items-start gap-3">
+                        <div className="flex-1 space-y-3">
+                          <div>
+                            <label className={`text-xs font-medium block mb-1 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>
+                              Fält
+                            </label>
+                            <select
+                              value={condition.field}
+                              onChange={(e) => {
+                                const newConditions = [...editingConditions];
+                                newConditions[index] = { ...condition, field: e.target.value };
+                                setEditingConditions(newConditions);
+                              }}
+                              className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                                lightMode
+                                  ? 'bg-white border-gray-300 text-gray-900'
+                                  : 'bg-slate-700 border-slate-600 text-white'
+                              }`}
+                            >
+                              <option value="@name">@name (attribut)</option>
+                              <option value="@dataType">@dataType (attribut)</option>
+                              <option value="value">value (elementvärde)</option>
+                              <option value="property">property (egenskap)</option>
+                              <option value="@id">@id (attribut)</option>
+                              <option value="@type">@type (attribut)</option>
+                            </select>
                           </div>
-                        </div>
-                        {isActive && (
-                          <div className={`w-6 h-6 rounded-full flex items-center justify-center ${lightMode ? 'bg-blue-600' : 'bg-blue-500'}`}>
-                            <span className="text-white text-sm font-bold">✓</span>
+
+                          <div>
+                            <label className={`text-xs font-medium block mb-1 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>
+                              Operator
+                            </label>
+                            <select
+                              value={condition.operator}
+                              onChange={(e) => {
+                                const newConditions = [...editingConditions];
+                                newConditions[index] = {
+                                  ...condition,
+                                  operator: e.target.value,
+                                  value: e.target.value === 'exists' ? null : condition.value
+                                };
+                                setEditingConditions(newConditions);
+                              }}
+                              className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                                lightMode
+                                  ? 'bg-white border-gray-300 text-gray-900'
+                                  : 'bg-slate-700 border-slate-600 text-white'
+                              }`}
+                            >
+                              <option value="equals">= (lika med)</option>
+                              <option value="contains">innehåller</option>
+                              <option value="startswith">börjar med</option>
+                              <option value="regex">regex (reguljärt uttryck)</option>
+                              <option value="exists">existerar (finns)</option>
+                            </select>
                           </div>
-                        )}
+
+                          {condition.operator !== 'exists' && (
+                            <div>
+                              <label className={`text-xs font-medium block mb-1 ${lightMode ? 'text-gray-700' : 'text-slate-300'}`}>
+                                Värde
+                              </label>
+                              <input
+                                type="text"
+                                value={condition.value || ''}
+                                onChange={(e) => {
+                                  const newConditions = [...editingConditions];
+                                  newConditions[index] = { ...condition, value: e.target.value };
+                                  setEditingConditions(newConditions);
+                                }}
+                                placeholder={condition.operator === 'regex' ? 't.ex. ^[A-Z].*' : 'Ange värde'}
+                                className={`w-full px-3 py-2 rounded-lg text-sm border focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                                  condition.operator === 'regex' ? 'font-mono' : ''
+                                } ${
+                                  lightMode
+                                    ? 'bg-white border-gray-300 text-gray-900'
+                                    : 'bg-slate-700 border-slate-600 text-white'
+                                }`}
+                              />
+                            </div>
+                          )}
+                        </div>
+
+                        <button
+                          onClick={() => {
+                            const newConditions = editingConditions.filter((_, i) => i !== index);
+                            setEditingConditions(newConditions);
+                          }}
+                          className={`mt-6 p-2 rounded-lg transition ${
+                            lightMode
+                              ? 'text-red-600 hover:bg-red-50'
+                              : 'text-red-400 hover:bg-red-900 hover:bg-opacity-20'
+                          }`}
+                          title="Ta bort villkor"
+                        >
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
                       </div>
-                      <p className={`text-xs leading-relaxed ${lightMode ? 'text-gray-600' : 'text-slate-400'}`}>
-                        {transform.id === 'uppercase' && 'Convert text to uppercase'}
-                        {transform.id === 'lowercase' && 'Convert text to lowercase'}
-                        {transform.id === 'trim' && 'Remove leading and trailing spaces'}
-                        {transform.id === 'concat' && 'Combine multiple values'}
-                        {transform.id === 'replace' && 'Replace specific text'}
-                        {transform.id === 'regex' && 'Use regular expressions to transform'}
-                        {transform.id === 'format' && 'Format text with custom pattern'}
-                        {transform.id === 'default' && 'Set default value if empty'}
-                      </p>
-                    </button>
+
+                      {/* Preview of condition */}
+                      <div className={`mt-3 pt-3 border-t text-xs ${
+                        lightMode ? 'border-amber-200 text-amber-700' : 'border-amber-700 text-amber-300'
+                      }`}>
+                        <span className="font-mono">
+                          {condition.field} {condition.operator === 'equals' ? '=' : condition.operator} {condition.operator !== 'exists' ? `"${condition.value || ''}"` : '(finns)'}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  setEditingConditions([
+                    ...editingConditions,
+                    { field: '@name', operator: 'equals', value: '' }
+                  ]);
+                }}
+                className={`mt-4 w-full px-4 py-2 rounded-lg text-sm font-medium border-2 border-dashed transition ${
+                  lightMode
+                    ? 'border-gray-300 hover:border-amber-400 hover:bg-amber-50 text-gray-700'
+                    : 'border-slate-600 hover:border-amber-500 hover:bg-amber-900 hover:bg-opacity-20 text-slate-300'
+                }`}
+              >
+                + Lägg till villkor
+              </button>
+            </div>
+
+            <div className={`px-6 py-4 ${lightMode ? 'border-gray-200' : 'border-slate-700'} border-t flex gap-3`}>
+              <button
+                onClick={() => {
+                  setShowConditionModal(false);
+                  setCurrentMappingForCondition(null);
+                  setEditingConditions([]);
+                }}
+                className={`flex-1 px-4 py-2 rounded-lg text-sm font-medium transition ${
+                  lightMode
+                    ? 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                    : 'bg-slate-700 hover:bg-slate-600 text-white'
+                }`}
+              >
+                Avbryt
+              </button>
+              <button
+                onClick={() => {
+                  // Validate conditions before saving
+                  const validConditions = editingConditions.filter(c =>
+                    c.field && c.operator && (c.operator === 'exists' || c.value)
                   );
-                })}
-              </div>
+
+                  saveConditions(currentMappingForCondition, validConditions.length > 0 ? validConditions : null);
+                  setShowConditionModal(false);
+                  setCurrentMappingForCondition(null);
+                  setEditingConditions([]);
+                }}
+                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium bg-gradient-to-r from-amber-600 to-amber-400 hover:from-amber-700 hover:to-amber-500 text-white transition"
+              >
+                Spara villkor
+              </button>
             </div>
           </div>
         </div>
@@ -2624,7 +2882,7 @@ const SchemaMapper = () => {
       {/* Constant Modal */}
       {showConstantModal && (
         <div
-          className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
+          className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 "
           onClick={() => {
             setShowConstantModal(false);
             setEditingConstantId(null);
@@ -2714,14 +2972,14 @@ const SchemaMapper = () => {
               <div className="flex gap-2">
                 <button
                   onClick={downloadLogs}
-                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm flex items-center gap-1"
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm flex items-center gap-1"
                 >
                   <Download className="w-4 h-4" />
                   Ladda ner
                 </button>
                 <button
                   onClick={clearLogs}
-                  className="px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-sm flex items-center gap-1"
+                  className="px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded text-sm flex items-center gap-1"
                 >
                   <Trash2 className="w-4 h-4" />
                   Rensa
