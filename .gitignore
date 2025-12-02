@@ -47,3 +47,6 @@ Schemas/
 #claude
 CLAUDE.md
 .claude/
+
+fhir_parse_result.json
+nul

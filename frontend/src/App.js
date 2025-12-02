@@ -64,6 +64,8 @@ const SchemaMapper = () => {
   // Refs
   const notificationTimeoutRef = useRef(null);
   const abortControllerRef = useRef(null);
+  const hoverThrottleRef = useRef(null);
+  const lastHoveredRef = useRef(null);
 
   // Logging
   const addLog = useCallback((level, message, data = null) => {
@@ -99,6 +101,25 @@ const SchemaMapper = () => {
       setNotification(null);
       notificationTimeoutRef.current = null;
     }, NOTIFICATION_TIMEOUT);
+  }, []);
+
+  // Throttled hover handling for better drag-and-drop performance with large schemas
+  const setHoveredTargetThrottled = useCallback((id) => {
+    // Skip if same as last hovered (avoid unnecessary updates)
+    if (lastHoveredRef.current === id) return;
+
+    lastHoveredRef.current = id;
+
+    // Clear existing throttle timer
+    if (hoverThrottleRef.current) {
+      clearTimeout(hoverThrottleRef.current);
+    }
+
+    // Throttle to max once per 50ms (20 updates/sec)
+    hoverThrottleRef.current = setTimeout(() => {
+      setHoveredTarget(id);
+      hoverThrottleRef.current = null;
+    }, 50);
   }, []);
 
   const downloadLogs = useCallback(() => {
@@ -319,8 +340,9 @@ const SchemaMapper = () => {
         setSourceSchema(schema);
         setMappings([]);
         setSelectedMapping(null);
-        setFolderNaming('guid');
-        setFolderNamingFields([]);
+        // Don't reset folder naming settings when uploading new schema
+        // setFolderNaming('guid');
+        // setFolderNamingFields([]);
         setShowFolderSettings(false);
 
         // Expand all nodes by default
@@ -358,8 +380,9 @@ const SchemaMapper = () => {
         setTargetSchema(schema);
         setMappings([]);
         setSelectedMapping(null);
-        setFolderNaming('guid');
-        setFolderNamingFields([]);
+        // Don't reset folder naming settings when uploading new schema
+        // setFolderNaming('guid');
+        // setFolderNamingFields([]);
         setShowFolderSettings(false);
 
         // Expand all nodes by default
@@ -999,6 +1022,15 @@ const SchemaMapper = () => {
     return tree;
   }, []);
 
+  // Memoize source and target trees to prevent rebuilding on every render (PERFORMANCE OPTIMIZATION for large schemas like FHIR)
+  const sourceTree = useMemo(() => {
+    return sourceSchema ? buildFieldTree(sourceSchema) : [];
+  }, [sourceSchema, buildFieldTree]);
+
+  const targetTree = useMemo(() => {
+    return targetSchema ? buildFieldTree(targetSchema) : [];
+  }, [targetSchema, buildFieldTree]);
+
   // Helper function to get all node keys for expanding
   const getAllNodeKeys = useCallback((schema, prefix) => {
     const keys = {};
@@ -1225,7 +1257,7 @@ const SchemaMapper = () => {
         <div
           onDragOver={!processing ? handleDragOver : undefined}
           onDrop={!processing ? (e) => handleDrop(e, node) : undefined}
-          onDragEnter={() => !processing && setHoveredTarget(node.id)}
+          onDragEnter={() => !processing && setHoveredTargetThrottled(node.id)}
           onDragLeave={() => setHoveredTarget(null)}
           className={`group relative ${lightMode ? 'bg-gradient-to-r from-emerald-50/60 to-emerald-100/40 hover:from-emerald-100/60 hover:to-emerald-200/40 border border-emerald-100 hover:border-emerald-300 shadow-sm hover:shadow' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-green-500'} p-2 rounded-lg mb-2 transition-all ${
             isHovered && !processing ? lightMode ? 'ring-2 ring-emerald-300' : 'ring-2 ring-green-400' : ''
@@ -1269,7 +1301,7 @@ const SchemaMapper = () => {
         </div>
       </div>
     );
-  }, [expandedNodes, getMappingsForTarget, hoveredTarget, processing, lightMode, handleDragOver, handleDrop, setHoveredTarget, setExpandedNodes, draggedField, setMappings, getSourceFieldName]);
+  }, [expandedNodes, getMappingsForTarget, hoveredTarget, processing, lightMode, handleDragOver, handleDrop, setHoveredTarget, setHoveredTargetThrottled, setExpandedNodes, draggedField, setMappings, getSourceFieldName]);
 
   const saveMappingConfig = useCallback(async () => {
     try {
@@ -1411,7 +1443,11 @@ const SchemaMapper = () => {
 
     setProcessing(true);
     addLog('info', 'Starting batch process');
-    
+
+    // Debug logging
+    console.log('[BATCH DEBUG] folderNaming:', folderNaming);
+    console.log('[BATCH DEBUG] folderNamingFields:', folderNamingFields);
+
     let timeoutId;
     try {
       const requestBody = {
@@ -1666,6 +1702,7 @@ const SchemaMapper = () => {
                           value={folderNamingFields}
                           onChange={(e) => {
                             const selected = Array.from(e.target.selectedOptions).map(o => o.value);
+                            console.log('[FOLDER NAMING] Selected fields:', selected);
                             setFolderNamingFields(selected);
                           }}
                           className={`w-full px-2 py-1.5 rounded text-xs border ${lightMode ? 'bg-white border-gray-300 text-gray-900' : 'bg-slate-800 border-slate-600 text-white'}`}
@@ -1829,14 +1866,13 @@ const SchemaMapper = () => {
                   Nytt fast värde
                 </button>
                 
-                {/* Hierarchical Field Tree */}
+                {/* Hierarchical Field Tree - Using memoized tree for performance */}
                 {(() => {
-                  const tree = buildFieldTree(sourceSchema);
                   // Skip root level if there's only one root node (container)
-                  if (tree.length === 1 && tree[0].isParent && tree[0].children) {
-                    return tree[0].children.map(node => renderTreeNode(node, 0, 'source'));
+                  if (sourceTree.length === 1 && sourceTree[0].isParent && sourceTree[0].children) {
+                    return sourceTree[0].children.map(node => renderTreeNode(node, 0, 'source'));
                   }
-                  return tree.map(node => renderTreeNode(node, 0, 'source'));
+                  return sourceTree.map(node => renderTreeNode(node, 0, 'source'));
                 })()}
               </>
             )}
@@ -2332,14 +2368,13 @@ const SchemaMapper = () => {
               </div>
             ) : (
               <>
-                {/* Hierarchical Field Tree */}
+                {/* Hierarchical Field Tree - Using memoized tree for performance */}
                 {(() => {
-                  const tree = buildFieldTree(targetSchema);
                   // Skip root level if there's only one root node (container)
-                  if (tree.length === 1 && tree[0].isParent && tree[0].children) {
-                    return tree[0].children.map(node => renderTargetTreeNode(node, 0, 'target'));
+                  if (targetTree.length === 1 && targetTree[0].isParent && targetTree[0].children) {
+                    return targetTree[0].children.map(node => renderTargetTreeNode(node, 0, 'target'));
                   }
-                  return tree.map(node => renderTargetTreeNode(node, 0, 'target'));
+                  return targetTree.map(node => renderTargetTreeNode(node, 0, 'target'));
                 })()}
 
                 {/* Regular Fields - REMOVED: Causes duplicates since tree already shows all fields */}

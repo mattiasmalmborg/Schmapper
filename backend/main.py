@@ -23,12 +23,63 @@ DEBUG = os.environ.get('SCHMAPPER_DEBUG', 'False').lower() == 'true'
 
 app = FastAPI()
 
+# Configure CORS - use environment variable for allowed origins (security best practice)
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def sanitize_filename(filename: str) -> str:
+    r"""
+    Sanitize a string to be safe for use as a folder or file name.
+    Removes or replaces invalid characters for both Windows and Unix filesystems.
+
+    Invalid characters: / \ : * ? " < > |
+    Also replaces spaces with underscores and removes leading/trailing whitespace.
+
+    Args:
+        filename: The string to sanitize
+
+    Returns:
+        A sanitized string safe for filesystem use, or empty string if nothing valid remains
+    """
+    if not filename:
+        return ""
+
+    # Convert to string and strip whitespace
+    filename = str(filename).strip()
+
+    # Replace invalid characters with underscore
+    # Invalid chars: / \ : * ? " < > |
+    invalid_chars = r'[/\\:*?"<>|]'
+    filename = re.sub(invalid_chars, '_', filename)
+
+    # Replace spaces with underscores
+    filename = filename.replace(' ', '_')
+
+    # Replace multiple consecutive underscores with single underscore
+    filename = re.sub(r'_+', '_', filename)
+
+    # Remove leading/trailing underscores
+    filename = filename.strip('_')
+
+    # Ensure not empty and not a reserved Windows name
+    reserved_names = {'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5',
+                      'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4',
+                      'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}
+    if filename.upper() in reserved_names:
+        filename = f"_{filename}"
+
+    return filename
 
 
 # ============================================================================
@@ -850,9 +901,42 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
             max_occurs = elem.get('maxOccurs', '1')
             return max_occurs == 'unbounded' or (max_occurs.isdigit() and int(max_occurs) > 1)
 
+        def find_sequence_in_complex_type(ct_elem):
+            """
+            Find xs:sequence in a complexType, checking both:
+            1. Direct child: <xs:complexType><xs:sequence>
+            2. Inside extension: <xs:complexType><xs:complexContent><xs:extension><xs:sequence>
+
+            Returns: sequence element or None
+            """
+            # Try direct sequence first
+            seq = ct_elem.find(f'{{{xsd_ns}}}sequence')
+            if seq is not None:
+                return seq
+
+            # Try inside complexContent/extension
+            complex_content = ct_elem.find(f'{{{xsd_ns}}}complexContent')
+            if complex_content is not None:
+                extension = complex_content.find(f'{{{xsd_ns}}}extension')
+                if extension is not None:
+                    seq = extension.find(f'{{{xsd_ns}}}sequence')
+                    if seq is not None:
+                        return seq
+
+            # Try inside simpleContent/extension (less common)
+            simple_content = ct_elem.find(f'{{{xsd_ns}}}simpleContent')
+            if simple_content is not None:
+                extension = simple_content.find(f'{{{xsd_ns}}}extension')
+                if extension is not None:
+                    seq = extension.find(f'{{{xsd_ns}}}sequence')
+                    if seq is not None:
+                        return seq
+
+            return None
+
         def extract_fields_from_complex_type(base_path, ct_elem):
             extracted_fields = []
-            seq = ct_elem.find(f'{{{xsd_ns}}}sequence')
+            seq = find_sequence_in_complex_type(ct_elem)
             if seq is not None:
                 for child_elem in seq.findall(f'{{{xsd_ns}}}element'):
                     child_name = child_elem.get('name')
@@ -946,13 +1030,13 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
             # Elements WITHOUT children are just repeatable FIELDS
             has_complex_content = False
             if inline_ct is not None:
-                seq = inline_ct.find(f'{{{xsd_ns}}}sequence')
+                seq = find_sequence_in_complex_type(inline_ct)
                 has_complex_content = seq is not None and len(seq) > 0
             elif type_ref:
                 clean_type = type_ref.split(':')[-1]
                 type_def = named_types.get(clean_type)
                 if type_def is not None:
-                    seq = type_def.find(f'{{{xsd_ns}}}sequence')
+                    seq = find_sequence_in_complex_type(type_def)
                     has_complex_content = seq is not None and len(seq) > 0
             
             # Only add to repeating_elements if it's a WRAPPER (has children)
@@ -997,7 +1081,7 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                 print(f"[TARGET XSD] Found repeatable FIELD (no wrapper): {current_path} (maxOccurs={max_occurs})")
 
             if inline_ct is not None:
-                seq = inline_ct.find(f'{{{xsd_ns}}}sequence')
+                seq = find_sequence_in_complex_type(inline_ct)
                 if seq is not None:
                     for child_elem in seq.findall(f'{{{xsd_ns}}}element'):
                         process_element(child_elem, current_path, depth + 1, new_visited)
@@ -1018,7 +1102,7 @@ async def parse_xsd_schema(file: UploadFile = File(...)):
                 type_def = named_types.get(clean_type)
 
                 if type_def is not None:
-                    seq = type_def.find(f'{{{xsd_ns}}}sequence')
+                    seq = find_sequence_in_complex_type(type_def)
                     if seq is not None:
                         for child_elem in seq.findall(f'{{{xsd_ns}}}element'):
                             process_element(child_elem, current_path, depth + 1, new_visited)
@@ -2210,8 +2294,13 @@ def apply_repeating_mappings_to_xml(
 async def batch_process(request: BatchProcessRequest):
     """Process all files with all mapping modes supported"""
     try:
+        if DEBUG:
+            print(f"\n[BATCH REQUEST DEBUG]")
+            print(f"  folder_naming: '{request.folder_naming}'")
+            print(f"  folder_naming_fields: {request.folder_naming_fields}")
+
         constants = request.constants or []
-        
+
         source_path = validate_path(request.source_path)
         target_path = validate_path(request.target_path)
         
@@ -2269,18 +2358,53 @@ async def batch_process(request: BatchProcessRequest):
                             for f in request.target_schema.fields:
                                 target_name_to_path[f.name] = f.path
 
+                            if DEBUG:
+                                print(f"\n[FOLDER NAMING DEBUG] folder_naming_fields: {request.folder_naming_fields}")
+                                print(f"[FOLDER NAMING DEBUG] All available field names: {list(target_name_to_path.keys())}")
+                                print(f"[FOLDER NAMING DEBUG] Complete name->path map:")
+                                for name, path in target_name_to_path.items():
+                                    print(f"  '{name}' -> '{path}'")
+
+                            if DEBUG:
+                                print(f"\n[FOLDER NAMING DEBUG] Keys in transformed dict:")
+                                for key in list(transformed.keys())[:20]:  # Show first 20 keys
+                                    print(f"  '{key}'")
+
                             name_parts = []
                             for field_name in request.folder_naming_fields:
                                 # Convert field name to path
                                 field_path = target_name_to_path.get(field_name, field_name)
                                 value = transformed.get(field_path, '')
+
+                                if DEBUG:
+                                    print(f"\n[FOLDER NAMING DEBUG] Field: '{field_name}'")
+                                    print(f"  → Path: '{field_path}'")
+                                    print(f"  → Value from transformed: '{value}' (type: {type(value).__name__})")
+
                                 if value:
-                                    name_parts.append(str(value).replace(' ', '_').replace('/', '_').replace('\\', '_'))
+                                    # Sanitize the value to make it safe for use as folder name
+                                    sanitized = sanitize_filename(value)
+                                    if DEBUG:
+                                        print(f"  → Sanitized: '{sanitized}'")
+                                    if sanitized:  # Only add if something remains after sanitization
+                                        name_parts.append(sanitized)
+                                    elif DEBUG:
+                                        print(f"  → SKIPPED: Empty after sanitization")
+                                elif DEBUG:
+                                    print(f"  → SKIPPED: Empty or missing value")
+
+                            if DEBUG:
+                                print(f"[FOLDER NAMING DEBUG] Final name_parts: {name_parts}")
 
                             if name_parts:
                                 folder_name = '_'.join(name_parts)
+                                if DEBUG:
+                                    print(f"[FOLDER NAMING DEBUG] Final folder_name: '{folder_name}'")
                             else:
+                                # Fall back to GUID if no valid name parts remain after sanitization
                                 folder_name = str(uuid.uuid4())
+                                if DEBUG:
+                                    print(f"[FOLDER NAMING DEBUG] No valid parts - using GUID: '{folder_name}'")
                         else:
                             folder_name = str(uuid.uuid4())
                         
@@ -2334,36 +2458,7 @@ async def batch_process(request: BatchProcessRequest):
                         constants
                     )
                     
-                    if request.folder_naming == "guid":
-                        folder_name = str(uuid.uuid4())
-                    elif request.folder_naming == "filename":
-                        folder_name = xml_file.stem
-                    elif request.folder_naming_fields:
-                        # Build name->path map for target fields
-                        target_name_to_path = {}
-                        for f in request.target_schema.fields:
-                            target_name_to_path[f.name] = f.path
-
-                        name_parts = []
-                        for field_name in request.folder_naming_fields:
-                            # Convert field name to path
-                            field_path = target_name_to_path.get(field_name, field_name)
-                            value = transformed.get(field_path, '')
-                            if value:
-                                name_parts.append(str(value).replace(' ', '_').replace('/', '_').replace('\\', '_'))
-
-                        if name_parts:
-                            folder_name = '_'.join(name_parts)
-                        else:
-                            folder_name = str(uuid.uuid4())
-                    else:
-                        folder_name = str(uuid.uuid4())
-                    
-                    output_folder = target_path / folder_name
-                    output_folder.mkdir(parents=True, exist_ok=True)
-                    print(f"[XML] Created output folder: {output_folder}")
-
-                    # Create XML structure
+                    # Create XML structure first (before folder naming)
                     print(f"[XML] Creating XML structure...")
                     target_root = create_xml_from_data(
                         transformed,
@@ -2387,6 +2482,76 @@ async def batch_process(request: BatchProcessRequest):
 
                     if instances > 0:
                         print(f"[XML] Created {instances} repeating element instances")
+
+                    # Now determine folder name AFTER all mappings have been applied
+                    if request.folder_naming == "guid":
+                        folder_name = str(uuid.uuid4())
+                    elif request.folder_naming == "filename":
+                        folder_name = xml_file.stem
+                    elif request.folder_naming_fields:
+                        # Build name->path map for target fields
+                        target_name_to_path = {}
+                        for f in request.target_schema.fields:
+                            target_name_to_path[f.name] = f.path
+
+                        if DEBUG:
+                            print(f"\n[FOLDER NAMING DEBUG - XML] folder_naming_fields: {request.folder_naming_fields}")
+                            print(f"[FOLDER NAMING DEBUG - XML] All available field names: {list(target_name_to_path.keys())}")
+
+                        name_parts = []
+                        for field_name in request.folder_naming_fields:
+                            # Convert field name to path
+                            field_path = target_name_to_path.get(field_name, field_name)
+
+                            # Extract value from XML tree using XPath
+                            # Build namespace-agnostic XPath
+                            path_parts = field_path.split('/')
+                            xpath_parts = [f'*[local-name()="{part}"]' for part in path_parts]
+                            xpath = '//' + '/'.join(xpath_parts)
+
+                            try:
+                                elements = target_root.xpath(xpath)
+                                value = elements[0].text if elements and len(elements) > 0 and elements[0].text else ''
+                            except Exception as e:
+                                if DEBUG:
+                                    print(f"[FOLDER NAMING DEBUG - XML] XPath error for {field_path}: {e}")
+                                value = ''
+
+                            if DEBUG:
+                                print(f"\n[FOLDER NAMING DEBUG - XML] Field: '{field_name}'")
+                                print(f"  -> Path: '{field_path}'")
+                                print(f"  -> XPath: {xpath}")
+                                print(f"  -> Value from XML: '{value}' (type: {type(value).__name__})")
+
+                            if value:
+                                # Sanitize the value to make it safe for use as folder name
+                                sanitized = sanitize_filename(str(value))
+                                if DEBUG:
+                                    print(f"  -> Sanitized: '{sanitized}'")
+                                if sanitized:
+                                    name_parts.append(sanitized)
+                                elif DEBUG:
+                                    print(f"  -> SKIPPED: Empty after sanitization")
+                            elif DEBUG:
+                                print(f"  -> SKIPPED: Empty or missing value")
+
+                        if DEBUG:
+                            print(f"[FOLDER NAMING DEBUG - XML] Final name_parts: {name_parts}")
+
+                        if name_parts:
+                            folder_name = '_'.join(name_parts)
+                            if DEBUG:
+                                print(f"[FOLDER NAMING DEBUG - XML] Final folder_name: '{folder_name}'")
+                        else:
+                            folder_name = str(uuid.uuid4())
+                            if DEBUG:
+                                print(f"[FOLDER NAMING DEBUG - XML] No valid parts - using GUID: '{folder_name}'")
+                    else:
+                        folder_name = str(uuid.uuid4())
+
+                    output_folder = target_path / folder_name
+                    output_folder.mkdir(parents=True, exist_ok=True)
+                    print(f"[XML] Created output folder: {output_folder}")
 
                     tree = ET.ElementTree(target_root)
                     output_file = output_folder / f"{folder_name}.xml"
